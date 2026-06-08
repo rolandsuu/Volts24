@@ -133,6 +133,7 @@ export async function POST(_request: Request, context: StartProcessingContext) {
       edit_plan_r2_key: null,
       voiceover_script_r2_key: null,
       subtitle_r2_key: null,
+      final_r2_key: null,
       provider_run_ids: {},
       updated_at: new Date().toISOString(),
     })

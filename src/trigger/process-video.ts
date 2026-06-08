@@ -36,7 +36,11 @@ type WorkerStage =
   | "writing_script"
   | "generating_voiceover"
   | "building_subtitles"
-  | "voiceover_subtitles_ready";
+  | "voiceover_subtitles_ready"
+  | "cutting_clips"
+  | "rendering_final"
+  | "uploading_final"
+  | "completed";
 
 type AssemblyAiSubmitResponse = {
   id?: unknown;
@@ -109,6 +113,10 @@ const STAGE_PROGRESS: Record<WorkerStage, number> = {
   generating_voiceover: 80,
   building_subtitles: 86,
   voiceover_subtitles_ready: 88,
+  cutting_clips: 91,
+  rendering_final: 95,
+  uploading_final: 98,
+  completed: 100,
 };
 
 const ASSEMBLYAI_PROVIDER = "assemblyai";
@@ -131,6 +139,10 @@ const MIN_EDIT_SEGMENT_DURATION_SECONDS = 0.25;
 const MAX_SUBTITLE_CHARS = 44;
 const MAX_SUBTITLE_DURATION_SECONDS = 4.5;
 const MIN_SUBTITLE_DURATION_SECONDS = 0.35;
+const FINAL_RENDER_WIDTH = 1080;
+const FINAL_RENDER_HEIGHT = 1920;
+const FINAL_RENDER_CRF = "23";
+const FINAL_RENDER_PRESET = "veryfast";
 const VISUAL_TIMELINE_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -552,9 +564,12 @@ async function uploadJsonToR2(key: string, value: unknown) {
   );
 }
 
-function runFfmpeg(args: string[]) {
+function runFfmpeg(args: string[], options?: { cwd?: string }) {
   return new Promise<void>((resolve, reject) => {
-    const child = spawn("ffmpeg", args, { stdio: "inherit" });
+    const child = spawn("ffmpeg", args, {
+      stdio: "inherit",
+      cwd: options?.cwd,
+    });
 
     child.on("error", (error) => {
       reject(error);
@@ -931,7 +946,11 @@ function roundSeconds(value: number) {
   return Math.round(value * 100) / 100;
 }
 
-async function getVideoDurationSeconds(filePath: string) {
+async function getMediaDurationSeconds(
+  filePath: string,
+  errorCode: string,
+  errorMessage: string
+) {
   const { stdout } = await runCommand("ffprobe", [
     "-v",
     "error",
@@ -944,14 +963,22 @@ async function getVideoDurationSeconds(filePath: string) {
   const duration = Number(stdout.trim());
 
   if (!Number.isFinite(duration) || duration <= 0) {
-    throw new WorkerError("Unable to read video duration with ffprobe", {
-      code: "ffprobe_duration_invalid",
+    throw new WorkerError(errorMessage, {
+      code: errorCode,
       provider: "ffmpeg",
       retryable: false,
     });
   }
 
   return duration;
+}
+
+async function getVideoDurationSeconds(filePath: string) {
+  return getMediaDurationSeconds(
+    filePath,
+    "ffprobe_duration_invalid",
+    "Unable to read video duration with ffprobe"
+  );
 }
 
 function buildFrameTimestamps(
@@ -1772,6 +1799,13 @@ type SubtitleCue = {
   text: string;
 };
 
+type RenderSegment = {
+  index: number;
+  sourceStart: number;
+  sourceEnd: number;
+  durationSeconds: number;
+};
+
 async function resolveBrandLanguageContext(
   _videoId: string,
   targetLanguage: string
@@ -2521,6 +2555,289 @@ function buildAssSubtitleFile(cues: SubtitleCue[]) {
   ].join("\n");
 }
 
+function formatFfmpegSeconds(value: number) {
+  return value.toFixed(3);
+}
+
+function getRenderSegments(editPlan: EditPlanArtifact): RenderSegment[] {
+  const segments = editPlan.segments;
+
+  if (!Array.isArray(segments) || segments.length === 0) {
+    throw new WorkerError("Edit plan does not contain renderable segments", {
+      code: "edit_plan_render_segments_invalid",
+      provider: OPENAI_PROVIDER,
+      retryable: true,
+    });
+  }
+
+  return segments.map((segment, index) => {
+    if (!isRecord(segment)) {
+      throw new WorkerError(`Edit plan segment ${index + 1} is invalid`, {
+        code: "edit_plan_render_segments_invalid",
+        provider: OPENAI_PROVIDER,
+        retryable: true,
+      });
+    }
+
+    const sourceStart = segment.sourceStart;
+    const sourceEnd = segment.sourceEnd;
+
+    if (
+      typeof sourceStart !== "number" ||
+      typeof sourceEnd !== "number" ||
+      !Number.isFinite(sourceStart) ||
+      !Number.isFinite(sourceEnd) ||
+      sourceEnd <= sourceStart
+    ) {
+      throw new WorkerError(
+        `Edit plan segment ${index + 1} has invalid render timestamps`,
+        {
+          code: "edit_plan_render_segments_invalid",
+          provider: OPENAI_PROVIDER,
+          retryable: true,
+        }
+      );
+    }
+
+    return {
+      index: index + 1,
+      sourceStart,
+      sourceEnd,
+      durationSeconds: sourceEnd - sourceStart,
+    };
+  });
+}
+
+async function assertNonEmptyFile(filePath: string, options: {
+  code: string;
+  message: string;
+}) {
+  const fileStats = await stat(filePath);
+
+  if (fileStats.size <= 0) {
+    throw new WorkerError(options.message, {
+      code: options.code,
+      provider: "ffmpeg",
+      retryable: true,
+    });
+  }
+
+  return fileStats;
+}
+
+async function countMediaStreams(
+  filePath: string,
+  streamType: "a" | "v"
+) {
+  const { stdout } = await runCommand("ffprobe", [
+    "-v",
+    "error",
+    "-select_streams",
+    streamType,
+    "-show_entries",
+    "stream=index",
+    "-of",
+    "csv=p=0",
+    filePath,
+  ]);
+  const trimmedOutput = stdout.trim();
+
+  return trimmedOutput ? trimmedOutput.split(/\r?\n/).length : 0;
+}
+
+async function renderMutedClipEdit(options: {
+  inputPath: string;
+  outputPath: string;
+  editPlan: EditPlanArtifact;
+  workDir: string;
+}) {
+  const segments = getRenderSegments(options.editPlan);
+  const segmentFilters = segments.map((segment, index) => {
+    const label = `v${index}`;
+
+    const filters = [
+      `[0:v]trim=start=${formatFfmpegSeconds(
+        segment.sourceStart
+      )}:end=${formatFfmpegSeconds(segment.sourceEnd)}`,
+      "setpts=PTS-STARTPTS",
+      `scale=${FINAL_RENDER_WIDTH}:${FINAL_RENDER_HEIGHT}:force_original_aspect_ratio=decrease`,
+      `pad=${FINAL_RENDER_WIDTH}:${FINAL_RENDER_HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
+      "setsar=1",
+      "format=yuv420p",
+    ];
+
+    return `${filters.join(",")}[${label}]`;
+  });
+  const filterParts = [...segmentFilters];
+  const outputLabel = segments.length === 1 ? "v0" : "vcat";
+
+  if (segments.length > 1) {
+    const concatInputs = segments
+      .map((_segment, index) => `[v${index}]`)
+      .join("");
+
+    filterParts.push(
+      `${concatInputs}concat=n=${segments.length}:v=1:a=0[${outputLabel}]`
+    );
+  }
+
+  await runFfmpeg(
+    [
+      "-y",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      path.basename(options.inputPath),
+      "-filter_complex",
+      filterParts.join(";"),
+      "-map",
+      `[${outputLabel}]`,
+      "-an",
+      "-c:v",
+      "libx264",
+      "-preset",
+      FINAL_RENDER_PRESET,
+      "-crf",
+      FINAL_RENDER_CRF,
+      "-movflags",
+      "+faststart",
+      path.basename(options.outputPath),
+    ],
+    { cwd: options.workDir }
+  );
+
+  await assertNonEmptyFile(options.outputPath, {
+    code: "muted_clip_render_empty",
+    message: "FFmpeg produced an empty muted clip edit",
+  });
+
+  const audioStreamCount = await countMediaStreams(options.outputPath, "a");
+
+  if (audioStreamCount > 0) {
+    throw new WorkerError("Muted clip edit unexpectedly contains audio", {
+      code: "muted_clip_render_has_audio",
+      provider: "ffmpeg",
+      retryable: true,
+    });
+  }
+
+  return {
+    selectedDurationSeconds: roundSeconds(
+      segments.reduce(
+        (total, segment) => total + segment.durationSeconds,
+        0
+      )
+    ),
+    segmentCount: segments.length,
+  };
+}
+
+async function renderFinalVideo(options: {
+  mutedClipEditPath: string;
+  voiceoverPath: string;
+  subtitlesPath: string;
+  outputPath: string;
+  workDir: string;
+}) {
+  const mutedDurationSeconds = await getMediaDurationSeconds(
+    options.mutedClipEditPath,
+    "ffprobe_muted_clip_duration_invalid",
+    "Unable to read muted clip duration with ffprobe"
+  );
+  const voiceoverDurationSeconds = await getMediaDurationSeconds(
+    options.voiceoverPath,
+    "ffprobe_voiceover_duration_invalid",
+    "Unable to read voiceover duration with ffprobe"
+  );
+  const padDurationSeconds = Math.max(
+    0,
+    voiceoverDurationSeconds - mutedDurationSeconds
+  );
+  const videoFilters = [
+    padDurationSeconds > 0
+      ? `tpad=stop_mode=clone:stop_duration=${formatFfmpegSeconds(
+          padDurationSeconds
+        )}`
+      : null,
+    `subtitles=${path.basename(options.subtitlesPath)}`,
+    "format=yuv420p",
+  ].filter((filter): filter is string => Boolean(filter));
+
+  await runFfmpeg(
+    [
+      "-y",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      path.basename(options.mutedClipEditPath),
+      "-i",
+      path.basename(options.voiceoverPath),
+      "-filter_complex",
+      `[0:v]${videoFilters.join(",")}[vout]`,
+      "-map",
+      "[vout]",
+      "-map",
+      "1:a:0",
+      "-c:v",
+      "libx264",
+      "-preset",
+      FINAL_RENDER_PRESET,
+      "-crf",
+      FINAL_RENDER_CRF,
+      "-c:a",
+      "aac",
+      "-b:a",
+      "192k",
+      "-movflags",
+      "+faststart",
+      path.basename(options.outputPath),
+    ],
+    { cwd: options.workDir }
+  );
+
+  const fileStats = await assertNonEmptyFile(options.outputPath, {
+    code: "final_render_empty",
+    message: "FFmpeg produced an empty final video",
+  });
+  const videoStreamCount = await countMediaStreams(options.outputPath, "v");
+  const audioStreamCount = await countMediaStreams(options.outputPath, "a");
+
+  if (videoStreamCount === 0 || audioStreamCount === 0) {
+    throw new WorkerError("Final video is missing video or audio streams", {
+      code: "final_render_streams_missing",
+      provider: "ffmpeg",
+      retryable: true,
+    });
+  }
+
+  const finalDurationSeconds = await getMediaDurationSeconds(
+    options.outputPath,
+    "ffprobe_final_duration_invalid",
+    "Unable to read final video duration with ffprobe"
+  );
+
+  if (
+    voiceoverDurationSeconds > mutedDurationSeconds &&
+    finalDurationSeconds + 0.1 < voiceoverDurationSeconds
+  ) {
+    throw new WorkerError("Final video is shorter than the voiceover", {
+      code: "final_render_voiceover_cut_off",
+      provider: "ffmpeg",
+      retryable: true,
+    });
+  }
+
+  return {
+    mutedDurationSeconds: roundSeconds(mutedDurationSeconds),
+    voiceoverDurationSeconds: roundSeconds(voiceoverDurationSeconds),
+    finalDurationSeconds: roundSeconds(finalDurationSeconds),
+    padDurationSeconds: roundSeconds(padDurationSeconds),
+    sizeBytes: fileStats.size,
+  };
+}
+
 function toWorkerError(error: unknown) {
   if (error instanceof WorkerError) {
     return error;
@@ -2554,6 +2871,8 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
   const framesDir = path.join(workDir, "frames");
   const voiceoverPath = path.join(workDir, "voiceover.mp3");
   const subtitlesPath = path.join(workDir, "subtitles.ass");
+  const mutedClipEditPath = path.join(workDir, "muted-edit.mp4");
+  const finalPath = path.join(workDir, "final.mp4");
   const audioR2Key = `artifacts/${payload.videoId}/audio.wav`;
   const transcriptR2Key = `artifacts/${payload.videoId}/transcript.json`;
   const visualTimelineR2Key = `artifacts/${payload.videoId}/visual-timeline.json`;
@@ -2561,6 +2880,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
   const voiceoverScriptR2Key = `artifacts/${payload.videoId}/voiceover-script.json`;
   const voiceoverR2Key = `artifacts/${payload.videoId}/voiceover.mp3`;
   const subtitleR2Key = `artifacts/${payload.videoId}/subtitles.ass`;
+  const finalR2Key = `videos/${payload.videoId}/final.mp4`;
 
   try {
     const video = await loadVideo(payload.videoId);
@@ -2596,6 +2916,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
       edit_plan_r2_key: null,
       voiceover_script_r2_key: null,
       subtitle_r2_key: null,
+      final_r2_key: null,
       provider_run_ids: {},
     });
 
@@ -2849,6 +3170,59 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
       edit_plan_r2_key: editPlanR2Key,
       voiceover_script_r2_key: voiceoverScriptR2Key,
       subtitle_r2_key: subtitleR2Key,
+      provider_request_id:
+        elevenLabsTtsRequestId ??
+        openAiScriptResponseId ??
+        openAiEditPlanResponseId ??
+        openAiVisualResponseId ??
+        transcriptId,
+      provider_run_ids: {
+        assemblyai_transcript_id: transcriptId,
+        openai_visual_response_id: openAiVisualResponseId,
+        openai_edit_plan_response_id: openAiEditPlanResponseId,
+        openai_script_response_id: openAiScriptResponseId,
+        elevenlabs_tts_request_id: elevenLabsTtsRequestId,
+      },
+      error_message: null,
+      error_code: null,
+      error_provider: null,
+      retryable: null,
+    });
+
+    stage = "cutting_clips";
+    await updateStage(payload.videoId, stage);
+    await renderMutedClipEdit({
+      inputPath,
+      outputPath: mutedClipEditPath,
+      editPlan,
+      workDir,
+    });
+
+    stage = "rendering_final";
+    await updateStage(payload.videoId, stage);
+    await renderFinalVideo({
+      mutedClipEditPath,
+      voiceoverPath,
+      subtitlesPath,
+      outputPath: finalPath,
+      workDir,
+    });
+
+    stage = "uploading_final";
+    await updateStage(payload.videoId, stage);
+    await uploadFileToR2(finalR2Key, finalPath, "video/mp4");
+
+    stage = "completed";
+    await updateVideo(payload.videoId, {
+      status: "completed",
+      current_stage: stage,
+      progress: STAGE_PROGRESS[stage],
+      transcript_r2_key: transcriptR2Key,
+      visual_timeline_r2_key: visualTimelineR2Key,
+      edit_plan_r2_key: editPlanR2Key,
+      voiceover_script_r2_key: voiceoverScriptR2Key,
+      subtitle_r2_key: subtitleR2Key,
+      final_r2_key: finalR2Key,
       provider_request_id:
         elevenLabsTtsRequestId ??
         openAiScriptResponseId ??
