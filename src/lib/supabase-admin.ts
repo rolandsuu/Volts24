@@ -1,4 +1,8 @@
 import { createClient } from "@supabase/supabase-js";
+import type { WebSocketLikeConstructor } from "@supabase/realtime-js";
+import WebSocket from "ws";
+
+const realtimeTransport = WebSocket as unknown as WebSocketLikeConstructor;
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseSecretKey =
@@ -16,6 +20,9 @@ export const supabaseAdmin = createClient(
   {
     auth: {
       persistSession: false,
+    },
+    realtime: {
+      transport: realtimeTransport,
     },
   }
 );
