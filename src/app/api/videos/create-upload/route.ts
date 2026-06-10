@@ -15,6 +15,9 @@ const ACCEPTED_CONTENT_TYPES = new Set([
   "video/quicktime",
 ]);
 
+const DEFAULT_UPLOAD_PROMPT =
+  "Create a key-event video with voiceover and subtitles";
+
 type CreateUploadBody = {
   filename?: unknown;
   contentType?: unknown;
@@ -56,13 +59,13 @@ export async function POST(request: Request) {
 
   const filename = getStringField(body, "filename");
   const contentType = getStringField(body, "contentType");
-  const prompt = getStringField(body, "prompt");
+  const prompt = getStringField(body, "prompt") ?? DEFAULT_UPLOAD_PROMPT;
   const targetLanguage = getStringField(body, "targetLanguage");
   const size = body.size;
 
-  if (!filename || !contentType || !prompt || !targetLanguage) {
+  if (!filename || !contentType || !targetLanguage) {
     return errorResponse(
-      "Missing required fields: filename, contentType, prompt, and targetLanguage are required",
+      "Missing required fields: filename, contentType, and targetLanguage are required",
       400
     );
   }

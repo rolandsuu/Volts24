@@ -8,6 +8,9 @@ type CreateUploadResponse = {
   uploadUrl: string;
 };
 
+const DEFAULT_UPLOAD_PROMPT =
+  "Create a key-event video with voiceover and subtitles";
+
 async function readErrorMessage(response: Response, fallback: string) {
   const text = await response.text().catch(() => "");
 
@@ -44,6 +47,7 @@ function isCreateUploadResponse(data: unknown): data is CreateUploadResponse {
 export default function Home() {
   const router = useRouter();
   const [file, setFile] = useState<File | null>(null);
+  const [prompt, setPrompt] = useState("");
   const [status, setStatus] = useState("Choose a video");
   const [isUploading, setIsUploading] = useState(false);
 
@@ -64,7 +68,7 @@ export default function Home() {
           filename: file.name,
           contentType: file.type,
           size: file.size,
-          prompt: "Create a key-event video with voiceover and subtitles",
+          prompt: prompt.trim() || DEFAULT_UPLOAD_PROMPT,
           targetLanguage: "en",
         }),
       });
@@ -133,6 +137,19 @@ export default function Home() {
         onChange={(event) => setFile(event.target.files?.[0] ?? null)}
       />
 
+      <label className="flex flex-col gap-2 text-sm">
+        <span className="font-medium">Prompt</span>
+        <textarea
+          value={prompt}
+          onChange={(event) => setPrompt(event.target.value)}
+          rows={4}
+          className="resize-y rounded border border-gray-300 px-3 py-2 text-base"
+        />
+        <span className="text-gray-500">
+          What is this video about? (optional).
+        </span>
+      </label>
+
       <button
         onClick={uploadVideo}
         disabled={!file || isUploading}
@@ -142,7 +159,6 @@ export default function Home() {
       </button>
 
       <p>{status}</p>
-
     </main>
   );
 }
