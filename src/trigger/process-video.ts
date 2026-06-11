@@ -7,6 +7,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 
+import { DEFAULT_TARGET_LANGUAGE } from "../lib/languages";
 import { r2, R2_BUCKET_NAME } from "../lib/r2";
 import { supabaseAdmin } from "../lib/supabase-admin";
 
@@ -2892,7 +2893,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
     const targetLanguage =
       typeof video.target_language === "string" && video.target_language.trim()
         ? video.target_language.trim()
-        : "en";
+        : DEFAULT_TARGET_LANGUAGE;
 
     if (!originalR2Key) {
       throw new WorkerError("Video record is missing an original R2 key", {

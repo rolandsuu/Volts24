@@ -3,6 +3,11 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 
+import {
+  DEFAULT_TARGET_LANGUAGE,
+  TARGET_LANGUAGE_OPTIONS,
+} from "@/lib/languages";
+
 type CreateUploadResponse = {
   videoId: string;
   uploadUrl: string;
@@ -48,6 +53,9 @@ export default function Home() {
   const router = useRouter();
   const [file, setFile] = useState<File | null>(null);
   const [prompt, setPrompt] = useState("");
+  const [targetLanguage, setTargetLanguage] = useState<string>(
+    DEFAULT_TARGET_LANGUAGE
+  );
   const [status, setStatus] = useState("Choose a video");
   const [isUploading, setIsUploading] = useState(false);
 
@@ -69,7 +77,7 @@ export default function Home() {
           contentType: file.type,
           size: file.size,
           prompt: prompt.trim() || DEFAULT_UPLOAD_PROMPT,
-          targetLanguage: "en",
+          targetLanguage,
         }),
       });
 
@@ -148,6 +156,21 @@ export default function Home() {
         <span className="text-gray-500">
           What is this video about? (optional).
         </span>
+      </label>
+
+      <label className="flex flex-col gap-2 text-sm">
+        <span className="font-medium">Target language</span>
+        <select
+          value={targetLanguage}
+          onChange={(event) => setTargetLanguage(event.target.value)}
+          className="rounded border border-gray-300 bg-white px-3 py-2 text-base text-black"
+        >
+          {TARGET_LANGUAGE_OPTIONS.map((language) => (
+            <option key={language.value} value={language.value}>
+              {language.label}
+            </option>
+          ))}
+        </select>
       </label>
 
       <button
