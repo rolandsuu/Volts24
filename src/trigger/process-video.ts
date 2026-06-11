@@ -145,6 +145,7 @@ const ELEVENLABS_DEFAULT_MODEL = "eleven_multilingual_v2";
 const ELEVENLABS_DEFAULT_OUTPUT_FORMAT = "mp3_44100_128";
 const DEFAULT_FRAME_SAMPLE_INTERVAL_SECONDS = 3;
 const DEFAULT_MAX_VISUAL_FRAMES = 30;
+const OPENAI_VISUAL_ANALYSIS_MAX_OUTPUT_TOKENS = 12000;
 const MAX_TRANSCRIPT_CONTEXT_CHARS = 6000;
 const MAX_EDIT_PLAN_UTTERANCES = 80;
 const MAX_EDIT_PLAN_WORDS = 300;
@@ -1363,7 +1364,7 @@ async function analyzeVisualTimeline(options: {
           schema: VISUAL_TIMELINE_SCHEMA,
         },
       },
-      max_output_tokens: 5000,
+      max_output_tokens: OPENAI_VISUAL_ANALYSIS_MAX_OUTPUT_TOKENS,
       store: false,
     }),
   });
@@ -1382,6 +1383,19 @@ async function analyzeVisualTimeline(options: {
         provider: OPENAI_PROVIDER,
         providerRequestId: requestId,
         retryable: response.status === 429 || response.status >= 500,
+      }
+    );
+  }
+
+  if (body.status === "incomplete") {
+    throw new WorkerError(
+      "OpenAI visual analysis response was incomplete before valid JSON was returned",
+      {
+        code: "openai_visual_analysis_incomplete",
+        provider: OPENAI_PROVIDER,
+        providerRequestId:
+          typeof body.id === "string" ? body.id : requestId ?? null,
+        retryable: true,
       }
     );
   }
