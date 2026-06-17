@@ -21,11 +21,6 @@ import {
   type InstructionDocumentArtifact,
   type InstructionDocumentArtifactStep,
 } from "../lib/instruction-document";
-import {
-  ElevenLabsVoiceConfigError,
-  getElevenLabsLanguageCode,
-  selectElevenLabsVoice,
-} from "../lib/elevenlabs-voice-config";
 import { DEFAULT_TARGET_LANGUAGE } from "../lib/languages";
 import { r2, R2_BUCKET_NAME } from "../lib/r2";
 import {
@@ -33,12 +28,14 @@ import {
   SubtitleCueGenerationError,
 } from "../lib/subtitle-cues";
 import { supabaseAdmin } from "../lib/supabase-admin";
+import { getTargetLanguageCode } from "../lib/target-language";
 import {
   VIDEO_EVENT_ANALYSIS_SCHEMA,
   VideoEventAnalysisValidationError,
   validateVideoEventAnalysis,
   type VideoEventAnalysisArtifact,
 } from "../lib/video-event-analysis";
+import { buildVoiceoverAlignmentFromTranscript } from "../lib/voiceover-alignment";
 import {
   buildAssSubtitleFile,
   buildClipScalePadFilters,
@@ -172,14 +169,13 @@ const ASSEMBLYAI_POLL_INTERVAL_MS = 3000;
 const OPENAI_PROVIDER = "openai";
 const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
 const OPENAI_DEFAULT_MODEL = "gpt-5-mini";
+const OPENAI_TTS_DEFAULT_MODEL = "gpt-4o-mini-tts";
+const OPENAI_TTS_DEFAULT_VOICE = "cedar";
+const OPENAI_TTS_OUTPUT_FORMAT = "mp3";
 const GEMINI_PROVIDER = "gemini";
 const GEMINI_DEFAULT_MODEL = "gemini-3.5-flash";
 const GEMINI_FILE_PROCESSING_TIMEOUT_MS = 10 * 60 * 1000;
 const GEMINI_FILE_POLL_INTERVAL_MS = 3000;
-const ELEVENLABS_PROVIDER = "elevenlabs";
-const ELEVENLABS_DEFAULT_BASE_URL = "https://api.elevenlabs.io/v1";
-const ELEVENLABS_DEFAULT_MODEL = "eleven_multilingual_v2";
-const ELEVENLABS_DEFAULT_OUTPUT_FORMAT = "mp3_44100_128";
 const DEFAULT_FRAME_SAMPLE_INTERVAL_SECONDS = 3;
 const DEFAULT_MAX_VISUAL_FRAMES = 30;
 const OPENAI_VISUAL_ANALYSIS_MAX_OUTPUT_TOKENS = 12000;
@@ -688,6 +684,12 @@ function normalizeBaseUrl(baseUrl: string) {
   return baseUrl.replace(/\/+$/, "");
 }
 
+function getOptionalStringEnv(name: string) {
+  const value = process.env[name];
+
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
 function getPositiveNumberEnv(name: string, fallback: number) {
   const rawValue = process.env[name];
 
@@ -846,48 +848,26 @@ function getGeminiVideoContentType(contentType: string | null) {
   );
 }
 
-function getElevenLabsConfig(targetLanguage: string) {
-  const apiKey = process.env.ELEVENLABS_API_KEY;
+function getOpenAiTtsConfig() {
+  const apiKey = process.env.OPENAI_API_KEY;
 
   if (!apiKey) {
-    throw new WorkerError(
-      "Missing ElevenLabs API key. Set ELEVENLABS_API_KEY.",
-      {
-        code: "elevenlabs_api_key_missing",
-        provider: ELEVENLABS_PROVIDER,
-        retryable: false,
-      }
-    );
-  }
-
-  let voiceSelection;
-
-  try {
-    voiceSelection = selectElevenLabsVoice(targetLanguage, process.env);
-  } catch (error) {
-    if (error instanceof ElevenLabsVoiceConfigError) {
-      throw new WorkerError(error.message, {
-        code: error.code,
-        provider: ELEVENLABS_PROVIDER,
-        retryable: false,
-      });
-    }
-
-    throw error;
+    throw new WorkerError("Missing OpenAI API key. Set OPENAI_API_KEY.", {
+      code: "openai_api_key_missing",
+      provider: OPENAI_PROVIDER,
+      retryable: false,
+    });
   }
 
   return {
     apiKey,
-    voiceId: voiceSelection.voiceId,
-    voiceEnvVarName: voiceSelection.envVarName,
-    languageCode: voiceSelection.languageCode,
     baseUrl: normalizeBaseUrl(
-      process.env.ELEVENLABS_BASE_URL ?? ELEVENLABS_DEFAULT_BASE_URL
+      process.env.OPENAI_BASE_URL ?? OPENAI_DEFAULT_BASE_URL
     ),
-    modelId: process.env.ELEVENLABS_MODEL_ID ?? ELEVENLABS_DEFAULT_MODEL,
-    outputFormat:
-      process.env.ELEVENLABS_OUTPUT_FORMAT ??
-      ELEVENLABS_DEFAULT_OUTPUT_FORMAT,
+    model: getOptionalStringEnv("OPENAI_TTS_MODEL") ?? OPENAI_TTS_DEFAULT_MODEL,
+    voice: getOptionalStringEnv("OPENAI_TTS_VOICE") ?? OPENAI_TTS_DEFAULT_VOICE,
+    instructions: getOptionalStringEnv("OPENAI_TTS_INSTRUCTIONS"),
+    responseFormat: OPENAI_TTS_OUTPUT_FORMAT,
   };
 }
 
@@ -1310,70 +1290,6 @@ function getOpenAiErrorMessage(body: unknown, fallback: string) {
   return fallback;
 }
 
-function getElevenLabsErrorMessage(body: unknown, fallback: string) {
-  if (body && typeof body === "object") {
-    if ("detail" in body) {
-      const detail = (body as { detail?: unknown }).detail;
-
-      if (typeof detail === "string" && detail.trim()) {
-        return detail;
-      }
-
-      if (Array.isArray(detail) && detail.length > 0) {
-        return JSON.stringify(detail);
-      }
-
-      if (detail && typeof detail === "object") {
-        const message = (detail as { message?: unknown }).message;
-
-        if (typeof message === "string" && message.trim()) {
-          return message;
-        }
-
-        return JSON.stringify(detail);
-      }
-    }
-
-    if ("message" in body) {
-      const message = (body as { message?: unknown }).message;
-
-      if (typeof message === "string" && message.trim()) {
-        return message;
-      }
-    }
-  }
-
-  if (typeof body === "string" && body.trim()) {
-    return body;
-  }
-
-  return fallback;
-}
-
-function getRequestIdFromRecord(value: unknown): string | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-
-  const requestId = value.request_id;
-
-  return typeof requestId === "string" && requestId.trim()
-    ? requestId
-    : null;
-}
-
-function getElevenLabsProviderRequestId(response: Response, body: unknown) {
-  if (isRecord(body)) {
-    return (
-      getProviderRequestId(response) ??
-      getRequestIdFromRecord(body) ??
-      getRequestIdFromRecord(body.detail)
-    );
-  }
-
-  return getProviderRequestId(response);
-}
-
 function extractOpenAiOutputText(body: OpenAiResponsesResponse) {
   if (typeof body.output_text === "string" && body.output_text.trim()) {
     return body.output_text;
@@ -1433,7 +1349,8 @@ function buildProviderRunIds(ids: {
   openAiEditPlanResponseId?: string | null;
   openAiInstructionDocumentResponseId?: string | null;
   openAiScriptResponseId?: string | null;
-  elevenLabsTtsRequestId?: string | null;
+  openAiTtsRequestId?: string | null;
+  assemblyAiVoiceoverTranscriptId?: string | null;
 }) {
   const providerRunIds: Record<string, string> = {};
 
@@ -1464,8 +1381,13 @@ function buildProviderRunIds(ids: {
     providerRunIds.openai_script_response_id = ids.openAiScriptResponseId;
   }
 
-  if (ids.elevenLabsTtsRequestId) {
-    providerRunIds.elevenlabs_tts_request_id = ids.elevenLabsTtsRequestId;
+  if (ids.openAiTtsRequestId) {
+    providerRunIds.openai_tts_request_id = ids.openAiTtsRequestId;
+  }
+
+  if (ids.assemblyAiVoiceoverTranscriptId) {
+    providerRunIds.assemblyai_voiceover_transcript_id =
+      ids.assemblyAiVoiceoverTranscriptId;
   }
 
   return providerRunIds;
@@ -2531,12 +2453,6 @@ async function generateInstructionDocument(options: {
   };
 }
 
-type ElevenLabsAlignment = {
-  characters: string[];
-  characterStartTimesSeconds: number[];
-  characterEndTimesSeconds: number[];
-};
-
 type RenderSegment = {
   index: number;
   sourceStart: number;
@@ -2899,185 +2815,62 @@ async function generateVoiceoverScript(options: {
   };
 }
 
-function parseElevenLabsAlignment(value: unknown): ElevenLabsAlignment | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-
-  const characters = value.characters;
-  const starts = value.character_start_times_seconds;
-  const ends = value.character_end_times_seconds;
-
-  if (!Array.isArray(characters) || !Array.isArray(starts) || !Array.isArray(ends)) {
-    return null;
-  }
-
-  if (
-    characters.length === 0 ||
-    characters.length !== starts.length ||
-    characters.length !== ends.length
-  ) {
-    return null;
-  }
-
-  const parsedCharacters: string[] = [];
-  const parsedStarts: number[] = [];
-  const parsedEnds: number[] = [];
-  let previousStart = -Infinity;
-  let previousEnd = -Infinity;
-
-  for (let index = 0; index < characters.length; index += 1) {
-    const character = characters[index];
-    const start = starts[index];
-    const end = ends[index];
-
-    if (
-      typeof character !== "string" ||
-      typeof start !== "number" ||
-      typeof end !== "number" ||
-      !Number.isFinite(start) ||
-      !Number.isFinite(end) ||
-      start < 0 ||
-      end < start ||
-      start < previousStart ||
-      end < previousEnd
-    ) {
-      return null;
-    }
-
-    parsedCharacters.push(character);
-    parsedStarts.push(start);
-    parsedEnds.push(end);
-    previousStart = start;
-    previousEnd = end;
-  }
-
-  return {
-    characters: parsedCharacters,
-    characterStartTimesSeconds: parsedStarts,
-    characterEndTimesSeconds: parsedEnds,
-  };
-}
-
-function selectElevenLabsAlignment(
-  body: Record<string, unknown>,
-  script: string,
-  providerRequestId: string | null
-) {
-  const scriptCharacters = Array.from(script);
-  const candidates = [
-    {
-      alignment: parseElevenLabsAlignment(body.normalized_alignment),
-      usedNormalizedAlignment: true,
-    },
-    {
-      alignment: parseElevenLabsAlignment(body.alignment),
-      usedNormalizedAlignment: false,
-    },
-  ];
-
-  for (const candidate of candidates) {
-    if (
-      candidate.alignment &&
-      candidate.alignment.characters.length === scriptCharacters.length
-    ) {
-      return candidate as {
-        alignment: ElevenLabsAlignment;
-        usedNormalizedAlignment: boolean;
-      };
-    }
-  }
-
-  throw new WorkerError(
-    "ElevenLabs response did not include usable character timing alignment for the validated script",
-    {
-      code: "elevenlabs_alignment_invalid",
-      provider: ELEVENLABS_PROVIDER,
-      providerRequestId,
-      retryable: true,
-    }
-  );
-}
-
-async function generateElevenLabsVoiceover(options: {
+async function generateOpenAiVoiceover(options: {
   script: string;
-  targetLanguage: string;
-  brandLanguageContext: BrandLanguageContext;
   outputPath: string;
 }) {
   const {
     apiKey,
-    voiceId,
-    voiceEnvVarName,
-    languageCode,
     baseUrl,
-    modelId,
-    outputFormat,
-  } = getElevenLabsConfig(options.targetLanguage);
-  const url = new URL(
-    `${baseUrl}/text-to-speech/${encodeURIComponent(
-      voiceId
-    )}/with-timestamps`
-  );
-  url.searchParams.set("output_format", outputFormat);
-
+    model,
+    voice,
+    instructions,
+    responseFormat,
+  } = getOpenAiTtsConfig();
   const requestBody: Record<string, unknown> = {
-    text: options.script,
-    model_id: modelId,
+    model,
+    voice,
+    input: options.script,
+    response_format: responseFormat,
   };
 
-  if (languageCode) {
-    requestBody.language_code = languageCode;
+  if (instructions) {
+    requestBody.instructions = instructions;
   }
 
-  if (
-    options.brandLanguageContext.pronunciationDictionaryLocators.length > 0
-  ) {
-    requestBody.pronunciation_dictionary_locators =
-      options.brandLanguageContext.pronunciationDictionaryLocators;
-  }
-
-  const response = await fetch(url, {
+  const response = await fetch(`${baseUrl}/audio/speech`, {
     method: "POST",
     headers: {
+      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
-      "xi-api-key": apiKey,
     },
     body: JSON.stringify(requestBody),
   });
-  const body = (await readJsonResponse(response)) as unknown;
-  const requestId = getElevenLabsProviderRequestId(response, body);
+  const requestId = getProviderRequestId(response);
 
   if (!response.ok) {
+    const body = await readJsonResponse(response);
+
     throw new WorkerError(
-      getElevenLabsErrorMessage(
+      getOpenAiErrorMessage(
         body,
-        `ElevenLabs voiceover generation failed with HTTP ${response.status}`
+        `OpenAI voiceover generation failed with HTTP ${response.status}`
       ),
       {
-        code: "elevenlabs_tts_failed",
-        provider: ELEVENLABS_PROVIDER,
+        code: "openai_tts_failed",
+        provider: OPENAI_PROVIDER,
         providerRequestId: requestId,
         retryable: response.status === 429 || response.status >= 500,
       }
     );
   }
 
-  if (!isRecord(body) || typeof body.audio_base64 !== "string") {
-    throw new WorkerError("ElevenLabs response did not include audio_base64", {
-      code: "elevenlabs_audio_missing",
-      provider: ELEVENLABS_PROVIDER,
-      providerRequestId: requestId,
-      retryable: true,
-    });
-  }
-
-  const audioBuffer = Buffer.from(body.audio_base64, "base64");
+  const audioBuffer = Buffer.from(await response.arrayBuffer());
 
   if (audioBuffer.length === 0) {
-    throw new WorkerError("ElevenLabs produced an empty voiceover audio file", {
-      code: "elevenlabs_audio_empty",
-      provider: ELEVENLABS_PROVIDER,
+    throw new WorkerError("OpenAI produced an empty voiceover audio file", {
+      code: "openai_tts_audio_empty",
+      provider: OPENAI_PROVIDER,
       providerRequestId: requestId,
       retryable: true,
     });
@@ -3085,22 +2878,13 @@ async function generateElevenLabsVoiceover(options: {
 
   await writeFile(options.outputPath, audioBuffer);
 
-  const providerRequestId = requestId;
-  const { alignment, usedNormalizedAlignment } = selectElevenLabsAlignment(
-    body,
-    options.script,
-    providerRequestId
-  );
-
   return {
-    provider: ELEVENLABS_PROVIDER,
-    providerRequestId,
-    modelId,
-    outputFormat,
-    languageCode,
-    voiceEnvVarName,
-    usedNormalizedAlignment,
-    alignment,
+    provider: OPENAI_PROVIDER,
+    providerRequestId: requestId,
+    model,
+    voice,
+    outputFormat: responseFormat,
+    instructionsApplied: Boolean(instructions),
   };
 }
 
@@ -4082,7 +3866,8 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
   let openAiEditPlanResponseId: string | null = null;
   let openAiInstructionDocumentResponseId: string | null = null;
   let openAiScriptResponseId: string | null = null;
-  let elevenLabsTtsRequestId: string | null = null;
+  let openAiTtsRequestId: string | null = null;
+  let assemblyAiVoiceoverTranscriptId: string | null = null;
   const workDir = await mkdtemp(
     path.join(os.tmpdir(), `blooclip-${payload.videoId}-`)
   );
@@ -4542,13 +4327,11 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
 
     stage = "generating_voiceover";
     await updateStage(payload.videoId, stage);
-    const voiceover = await generateElevenLabsVoiceover({
+    const voiceover = await generateOpenAiVoiceover({
       script: voiceoverScript.script,
-      targetLanguage,
-      brandLanguageContext,
       outputPath: voiceoverPath,
     });
-    elevenLabsTtsRequestId =
+    openAiTtsRequestId =
       typeof voiceover.providerRequestId === "string"
         ? voiceover.providerRequestId
         : null;
@@ -4556,12 +4339,42 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
 
     stage = "building_subtitles";
     await updateStage(payload.videoId, stage);
+    const voiceoverAssemblyAiAudioUrl = await uploadToAssemblyAi(voiceoverPath);
+    assemblyAiVoiceoverTranscriptId = await submitAssemblyAiTranscript(
+      voiceoverAssemblyAiAudioUrl
+    );
+    await updateVideo(payload.videoId, {
+      provider_request_id: assemblyAiVoiceoverTranscriptId ?? openAiTtsRequestId,
+      provider_run_ids: buildProviderRunIds({
+        assemblyAiTranscriptId: transcriptId,
+        geminiVideoEventResponseId,
+        openAiVisualResponseId,
+        openAiEditPlanResponseId,
+        openAiInstructionDocumentResponseId,
+        openAiScriptResponseId,
+        openAiTtsRequestId,
+        assemblyAiVoiceoverTranscriptId,
+      }),
+    });
+    const voiceoverTranscript = await pollAssemblyAiTranscript(
+      assemblyAiVoiceoverTranscriptId
+    );
+    const voiceoverDurationSeconds = await getMediaDurationSeconds(
+      voiceoverPath,
+      "ffprobe_voiceover_duration_invalid",
+      "Unable to read voiceover duration with ffprobe"
+    );
+    const voiceoverAlignment = buildVoiceoverAlignmentFromTranscript({
+      script: voiceoverScript.script,
+      transcriptWords: voiceoverTranscript.words,
+      durationSeconds: voiceoverDurationSeconds,
+    });
     let subtitleCues: SubtitleCue[];
 
     try {
       subtitleCues = buildSubtitleCues(
         voiceoverScript.script,
-        voiceover.alignment,
+        voiceoverAlignment.alignment,
         { targetLanguage }
       );
     } catch (error) {
@@ -4597,7 +4410,8 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
       voiceover_script_r2_key: voiceoverScriptR2Key,
       subtitle_r2_key: subtitleR2Key,
       provider_request_id:
-        elevenLabsTtsRequestId ??
+        openAiTtsRequestId ??
+        assemblyAiVoiceoverTranscriptId ??
         openAiScriptResponseId ??
         openAiInstructionDocumentResponseId ??
         openAiEditPlanResponseId ??
@@ -4611,7 +4425,8 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         openAiEditPlanResponseId,
         openAiInstructionDocumentResponseId,
         openAiScriptResponseId,
-        elevenLabsTtsRequestId,
+        openAiTtsRequestId,
+        assemblyAiVoiceoverTranscriptId,
       }),
       error_message: null,
       error_code: null,
@@ -4638,7 +4453,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
       outputPath: finalPath,
       workDir,
       subtitleFontsDir: SUBTITLE_FONTS_DIR,
-      requireBurnedSubtitles: getElevenLabsLanguageCode(targetLanguage) === "zh",
+      requireBurnedSubtitles: getTargetLanguageCode(targetLanguage) === "zh",
     });
 
     stage = "uploading_final";
@@ -4662,7 +4477,8 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
       subtitle_r2_key: subtitleR2Key,
       final_r2_key: finalR2Key,
       provider_request_id:
-        elevenLabsTtsRequestId ??
+        openAiTtsRequestId ??
+        assemblyAiVoiceoverTranscriptId ??
         openAiScriptResponseId ??
         openAiInstructionDocumentResponseId ??
         openAiEditPlanResponseId ??
@@ -4676,7 +4492,8 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         openAiEditPlanResponseId,
         openAiInstructionDocumentResponseId,
         openAiScriptResponseId,
-        elevenLabsTtsRequestId,
+        openAiTtsRequestId,
+        assemblyAiVoiceoverTranscriptId,
       }),
       error_message: null,
       error_code: null,
@@ -4693,7 +4510,8 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
       error_provider: workerError.provider,
       provider_request_id:
         workerError.providerRequestId ??
-        elevenLabsTtsRequestId ??
+        assemblyAiVoiceoverTranscriptId ??
+        openAiTtsRequestId ??
         openAiScriptResponseId ??
         openAiInstructionDocumentResponseId ??
         openAiEditPlanResponseId ??

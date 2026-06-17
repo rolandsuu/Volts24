@@ -1,4 +1,4 @@
-import { getElevenLabsLanguageCode } from "./elevenlabs-voice-config.ts";
+import { getTargetLanguageCode } from "./target-language.ts";
 import type { SubtitleCue } from "./video-rendering.ts";
 
 export type SubtitleAlignment = {
@@ -205,7 +205,7 @@ export function buildSubtitleCues(
   alignment: SubtitleAlignment,
   options: { targetLanguage: string }
 ): SubtitleCue[] {
-  const isChinese = getElevenLabsLanguageCode(options.targetLanguage) === "zh";
+  const isChinese = getTargetLanguageCode(options.targetLanguage) === "zh";
   const units = isChinese
     ? buildChineseSubtitleUnits(script, alignment)
     : buildSubtitleWords(script, alignment);
