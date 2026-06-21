@@ -39,7 +39,6 @@ function parseVideoInput(
     filename?: unknown;
     contentType?: unknown;
     size?: unknown;
-    prompt?: unknown;
   };
   const filename = getTrimmedString(video.filename);
   const contentType = getTrimmedString(video.contentType);
@@ -58,7 +57,7 @@ function parseVideoInput(
     filename,
     contentType,
     size: video.size,
-    prompt: normalizePrompt(video.prompt),
+    prompt: normalizePrompt(null),
     targetLanguage,
   };
 

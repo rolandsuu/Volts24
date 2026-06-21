@@ -6,16 +6,18 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { r2, R2_BUCKET_NAME } from "@/lib/r2";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 
+export {
+  DEFAULT_UPLOAD_PROMPT,
+  MAX_BATCH_UPLOAD_FILES,
+  getTrimmedString,
+  normalizePrompt,
+} from "./upload-settings";
+
 export const ACCEPTED_VIDEO_CONTENT_TYPES = new Set([
   "video/mp4",
   "video/webm",
   "video/quicktime",
 ]);
-
-export const DEFAULT_UPLOAD_PROMPT =
-  "Create a key-event video with voiceover and subtitles";
-
-export const MAX_BATCH_UPLOAD_FILES = 20;
 
 export type VideoUploadInput = {
   filename: string;
@@ -44,21 +46,9 @@ export class UploadValidationError extends Error {
   }
 }
 
-export function getTrimmedString(value: unknown) {
-  if (typeof value !== "string" || value.trim() === "") {
-    return null;
-  }
-
-  return value.trim();
-}
-
 export function sanitizeFilename(filename: string) {
   const sanitized = filename.replace(/[^a-zA-Z0-9._-]+/g, "_");
   return sanitized.slice(0, 120) || "video";
-}
-
-export function normalizePrompt(value: unknown) {
-  return getTrimmedString(value) ?? DEFAULT_UPLOAD_PROMPT;
 }
 
 export function assertValidVideoUploadInput(input: VideoUploadInput) {
