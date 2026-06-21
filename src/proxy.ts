@@ -1,12 +1,18 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
+import { isAuthDisabledForDev } from "@/lib/dev-auth";
 import { getSupabasePublicConfig } from "@/lib/supabase-config";
 
 export async function proxy(request: NextRequest) {
   let response = NextResponse.next({
     request,
   });
+
+  if (isAuthDisabledForDev()) {
+    return response;
+  }
+
   const { supabaseUrl, supabasePublishableKey } = getSupabasePublicConfig();
   const supabase = createServerClient(supabaseUrl, supabasePublishableKey, {
     cookies: {

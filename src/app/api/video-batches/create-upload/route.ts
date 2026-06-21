@@ -5,7 +5,11 @@ import {
   parseCreateUploadSessionBody,
   UploadValidationError,
 } from "@/lib/upload-sessions";
-import { AuthError, requireAuthenticatedUser } from "@/lib/auth";
+import {
+  AuthError,
+  getUserOwnershipId,
+  requireAuthenticatedUser,
+} from "@/lib/auth";
 
 export const runtime = "nodejs";
 
@@ -34,7 +38,7 @@ export async function POST(request: Request) {
     const uploadSession = await createUploadSession(
       {
         ...parseCreateUploadSessionBody(body),
-        userId: user.id,
+        userId: getUserOwnershipId(user),
       }
     );
 

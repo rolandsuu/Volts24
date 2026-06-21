@@ -65,11 +65,16 @@ function getHistoryStatus(input: {
   return "created";
 }
 
-export async function listUserVideoJobs(userId: string) {
-  const { data: batchData, error: batchError } = await supabaseAdmin
+async function listVideoJobs(userId?: string) {
+  const batchQuery = supabaseAdmin
     .from("video_batches")
-    .select("id,title,target_language,expected_video_count,created_at,updated_at")
-    .eq("user_id", userId)
+    .select(
+      "id,title,target_language,expected_video_count,created_at,updated_at"
+    );
+  const scopedBatchQuery = userId
+    ? batchQuery.eq("user_id", userId)
+    : batchQuery;
+  const { data: batchData, error: batchError } = await scopedBatchQuery
     .order("created_at", { ascending: false })
     .limit(50);
 
@@ -146,4 +151,12 @@ export async function listUserVideoJobs(userId: string) {
       (left, right) =>
         new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()
     );
+}
+
+export async function listUserVideoJobs(userId: string) {
+  return listVideoJobs(userId);
+}
+
+export async function listRecentVideoJobs() {
+  return listVideoJobs();
 }

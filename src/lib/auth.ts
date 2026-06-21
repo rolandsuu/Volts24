@@ -1,10 +1,19 @@
 import type { User } from "@supabase/supabase-js";
 
+import {
+  createDevBypassUser,
+  isAuthDisabledForDev,
+  isDevBypassUser,
+  getUserOwnershipId,
+} from "./dev-auth.ts";
 import { createSupabaseServerClient } from "./supabase-server.ts";
+
+export { getUserOwnershipId, isAuthDisabledForDev, isDevBypassUser };
 
 export type AuthenticatedUser = {
   id: string;
   email: string | null;
+  isDevBypass?: boolean;
 };
 
 export class AuthError extends Error {
@@ -25,6 +34,10 @@ function toAuthenticatedUser(user: User): AuthenticatedUser {
 }
 
 export async function getAuthenticatedUser() {
+  if (isAuthDisabledForDev()) {
+    return createDevBypassUser();
+  }
+
   const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase.auth.getUser();
 
@@ -49,6 +62,10 @@ export function assertCanAccessOwnedRecord(
   ownerUserId: string | null,
   user: AuthenticatedUser | null
 ) {
+  if (isAuthDisabledForDev()) {
+    return;
+  }
+
   if (!ownerUserId) {
     return;
   }

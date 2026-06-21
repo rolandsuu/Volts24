@@ -31,6 +31,9 @@ URLs to Supabase Auth redirect allow-list, including
 used as a fallback origin for sign-in links when request headers are not
 available.
 
+For local UI development only, set `AUTH_DISABLED_FOR_DEV=true` in `.env.local`
+to skip magic-link sign-in. This flag is ignored when `NODE_ENV=production`.
+
 `ASSEMBLYAI_BASE_URL` is optional and defaults to `https://api.assemblyai.com`.
 `OPENAI_BASE_URL` is optional and defaults to `https://api.openai.com/v1`.
 `OPENAI_WORKER_MODEL` is optional and defaults to `gpt-5-mini`.

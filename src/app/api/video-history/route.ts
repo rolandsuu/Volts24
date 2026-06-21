@@ -1,7 +1,11 @@
 import { NextResponse } from "next/server";
 
-import { AuthError, requireAuthenticatedUser } from "@/lib/auth";
-import { listUserVideoJobs } from "@/lib/video-history";
+import {
+  AuthError,
+  isDevBypassUser,
+  requireAuthenticatedUser,
+} from "@/lib/auth";
+import { listRecentVideoJobs, listUserVideoJobs } from "@/lib/video-history";
 
 export const runtime = "nodejs";
 
@@ -12,7 +16,9 @@ function errorResponse(error: string, status: number) {
 export async function GET() {
   try {
     const user = await requireAuthenticatedUser();
-    const history = await listUserVideoJobs(user.id);
+    const history = isDevBypassUser(user)
+      ? await listRecentVideoJobs()
+      : await listUserVideoJobs(user.id);
 
     return NextResponse.json({ history });
   } catch (error) {
