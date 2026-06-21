@@ -37,6 +37,7 @@ export type CreateUploadSessionInput = {
   title: string;
   targetLanguage: string;
   prompt: string;
+  userId?: string;
   videos: UploadSessionVideoInput[];
 };
 
@@ -44,6 +45,7 @@ export type UploadSessionBatchInput = {
   title: string;
   targetLanguage: string;
   expectedVideoCount: number;
+  userId?: string;
 };
 
 export type UploadSessionBatch = {
@@ -217,6 +219,7 @@ function defaultUploadSessionDependencies(): UploadSessionDependencies {
           title: input.title,
           target_language: input.targetLanguage,
           expected_video_count: input.expectedVideoCount,
+          ...(input.userId ? { user_id: input.userId } : {}),
         })
         .select("id")
         .single();
@@ -241,12 +244,14 @@ export async function createUploadSession(
     title: input.title,
     targetLanguage: input.targetLanguage,
     expectedVideoCount: input.videos.length,
+    ...(input.userId ? { userId: input.userId } : {}),
   });
 
   const videos = await Promise.all(
     input.videos.map((video, index) =>
       dependencies.createVideo({
         ...video,
+        ...(input.userId ? { userId: input.userId } : {}),
         batchId: batch.id,
         batchPosition: index,
       })
@@ -263,10 +268,14 @@ export async function createUploadSession(
 
 export async function createSingleVideoUploadSession(
   body: RawSingleVideoUploadBody,
-  dependencies?: UploadSessionDependencies
+  dependencies?: UploadSessionDependencies,
+  userId?: string
 ): Promise<SingleVideoUploadSessionRecord> {
   const session = await createUploadSession(
-    parseSingleVideoUploadSessionBody(body),
+    {
+      ...parseSingleVideoUploadSessionBody(body),
+      userId,
+    },
     dependencies
   );
   const upload = session.videos[0];

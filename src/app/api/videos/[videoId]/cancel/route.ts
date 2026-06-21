@@ -1,6 +1,8 @@
 import { runs } from "@trigger.dev/sdk/v3";
 import { NextResponse } from "next/server";
 
+import { AuthError } from "@/lib/auth";
+import { loadAccessibleVideo } from "@/lib/ownership";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 
 export const runtime = "nodejs";
@@ -15,6 +17,7 @@ type CancelVideoRow = {
   status: string;
   current_stage: string | null;
   trigger_run_id: string | null;
+  user_id: string | null;
 };
 
 const CANCELABLE_STATUSES = new Set(["queued", "processing"]);
@@ -30,21 +33,23 @@ export async function POST(_request: Request, context: CancelContext) {
     return errorResponse("Missing videoId", 400);
   }
 
-  const { data, error } = await supabaseAdmin
-    .from("videos")
-    .select("status,current_stage,trigger_run_id")
-    .eq("id", videoId)
-    .single();
+  let video: CancelVideoRow;
 
-  if (error) {
-    if (error.code === "PGRST116") {
-      return errorResponse("Video not found", 404);
+  try {
+    video = await loadAccessibleVideo<CancelVideoRow>(
+      videoId,
+      "status,current_stage,trigger_run_id,user_id"
+    );
+  } catch (error) {
+    if (error instanceof AuthError) {
+      return errorResponse(error.message, error.status);
     }
 
-    return errorResponse(`Failed to load video: ${error.message}`, 500);
-  }
+    const message =
+      error instanceof Error ? error.message : "Failed to load video";
 
-  const video = data as CancelVideoRow;
+    return errorResponse(message, 500);
+  }
 
   if (!CANCELABLE_STATUSES.has(video.status)) {
     return errorResponse(`Video cannot be canceled from status ${video.status}`, 409);

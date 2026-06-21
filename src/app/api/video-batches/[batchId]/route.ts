@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 
+import { AuthError } from "@/lib/auth";
+import { loadAccessibleBatch } from "@/lib/ownership";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 
 export const runtime = "nodejs";
@@ -17,6 +19,7 @@ type BatchRow = {
   expected_video_count: number;
   created_at: string;
   updated_at: string;
+  user_id: string | null;
 };
 
 type BatchVideoRow = {
@@ -46,23 +49,22 @@ export async function GET(_request: Request, context: BatchContext) {
     return errorResponse("Missing batchId", 400);
   }
 
-  const { data: batchData, error: batchError } = await supabaseAdmin
-    .from("video_batches")
-    .select(
-      "id,title,target_language,expected_video_count,created_at,updated_at"
-    )
-    .eq("id", batchId)
-    .single();
+  let batch: BatchRow;
 
-  if (batchError) {
-    if (batchError.code === "PGRST116") {
-      return errorResponse("Video batch not found", 404);
+  try {
+    batch = await loadAccessibleBatch<BatchRow>(
+      batchId,
+      "id,title,target_language,expected_video_count,created_at,updated_at,user_id"
+    );
+  } catch (error) {
+    if (error instanceof AuthError) {
+      return errorResponse(error.message, error.status);
     }
 
-    return errorResponse(
-      `Failed to load video batch: ${batchError.message}`,
-      500
-    );
+    const message =
+      error instanceof Error ? error.message : "Failed to load video batch";
+
+    return errorResponse(message, 500);
   }
 
   const { data: videosData, error: videosError } = await supabaseAdmin
@@ -78,7 +80,6 @@ export async function GET(_request: Request, context: BatchContext) {
     return errorResponse(`Failed to load videos: ${videosError.message}`, 500);
   }
 
-  const batch = batchData as BatchRow;
   const videos = (videosData ?? []) as BatchVideoRow[];
 
   return NextResponse.json({

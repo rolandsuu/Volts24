@@ -64,6 +64,56 @@ test("one-video upload session creates a batch-shaped response", async () => {
   });
 });
 
+test("upload sessions pass user ownership into batch and video records", async () => {
+  const input = {
+    ...parseCreateUploadSessionBody({
+      targetLanguage: "zh",
+      videos: [video("owned.mp4")],
+    }),
+    userId: "user-123",
+  };
+  const batches: unknown[] = [];
+  const videos: unknown[] = [];
+
+  await createUploadSession(input, {
+    async createBatch(batch) {
+      batches.push(batch);
+      return { id: "owned-batch" };
+    },
+    async createVideo(upload) {
+      videos.push(upload);
+
+      return {
+        videoId: "owned-video",
+        uploadUrl: "https://upload.test/owned",
+        filename: upload.filename,
+        batchPosition: upload.batchPosition ?? null,
+      };
+    },
+  });
+
+  assert.deepEqual(batches, [
+    {
+      title: "owned.mp4",
+      targetLanguage: "zh",
+      expectedVideoCount: 1,
+      userId: "user-123",
+    },
+  ]);
+  assert.deepEqual(videos, [
+    {
+      filename: "owned.mp4",
+      contentType: "video/mp4",
+      size: 1024,
+      prompt: input.prompt,
+      targetLanguage: "zh",
+      userId: "user-123",
+      batchId: "owned-batch",
+      batchPosition: 0,
+    },
+  ]);
+});
+
 test("ten upload videos are allowed", () => {
   const input = parseCreateUploadSessionBody({
     targetLanguage: "zh",

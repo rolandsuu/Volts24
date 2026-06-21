@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
-import { supabaseAdmin } from "@/lib/supabase-admin";
+import { AuthError } from "@/lib/auth";
+import { loadAccessibleVideo } from "@/lib/ownership";
 
 export const runtime = "nodejs";
 
@@ -30,6 +31,7 @@ type VideoStatusRow = {
   subtitle_r2_key: string | null;
   created_at: string;
   updated_at: string;
+  user_id: string | null;
 };
 
 function errorResponse(error: string, status: number) {
@@ -43,23 +45,23 @@ export async function GET(_request: Request, context: VideoContext) {
     return errorResponse("Missing videoId", 400);
   }
 
-  const { data, error } = await supabaseAdmin
-    .from("videos")
-    .select(
-      "id,status,progress,current_stage,error_message,error_code,error_provider,provider_request_id,retryable,final_r2_key,transcript_r2_key,video_event_analysis_r2_key,edit_plan_r2_key,instruction_doc_r2_key,instruction_pdf_r2_key,voiceover_script_r2_key,subtitle_r2_key,created_at,updated_at"
-    )
-    .eq("id", videoId)
-    .single();
+  let video: VideoStatusRow;
 
-  if (error) {
-    if (error.code === "PGRST116") {
-      return errorResponse("Video not found", 404);
+  try {
+    video = await loadAccessibleVideo<VideoStatusRow>(
+      videoId,
+      "id,status,progress,current_stage,error_message,error_code,error_provider,provider_request_id,retryable,final_r2_key,transcript_r2_key,video_event_analysis_r2_key,edit_plan_r2_key,instruction_doc_r2_key,instruction_pdf_r2_key,voiceover_script_r2_key,subtitle_r2_key,created_at,updated_at,user_id"
+    );
+  } catch (error) {
+    if (error instanceof AuthError) {
+      return errorResponse(error.message, error.status);
     }
 
-    return errorResponse(`Failed to load video: ${error.message}`, 500);
-  }
+    const message =
+      error instanceof Error ? error.message : "Failed to load video";
 
-  const video = data as VideoStatusRow;
+    return errorResponse(message, 500);
+  }
 
   return NextResponse.json({
     id: video.id,

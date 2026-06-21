@@ -4,6 +4,7 @@ import {
   UploadValidationError,
   createSingleVideoUploadSession,
 } from "@/lib/upload-sessions";
+import { AuthError, requireAuthenticatedUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 
@@ -29,8 +30,16 @@ export async function POST(request: Request) {
   }
 
   try {
-    return NextResponse.json(await createSingleVideoUploadSession(body));
+    const user = await requireAuthenticatedUser();
+
+    return NextResponse.json(
+      await createSingleVideoUploadSession(body, undefined, user.id)
+    );
   } catch (error) {
+    if (error instanceof AuthError) {
+      return errorResponse(error.message, error.status);
+    }
+
     if (error instanceof UploadValidationError) {
       return errorResponse(error.message, error.status);
     }

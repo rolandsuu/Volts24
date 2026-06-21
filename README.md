@@ -24,6 +24,13 @@ GEMINI_VIDEO_EVENT_ANALYSIS_ENABLED=false
 GEMINI_VIDEO_EVENT_ANALYSIS_REQUIRED=false
 ```
 
+Supabase Auth is used for magic-link sign-in. Add the local and production app
+URLs to Supabase Auth redirect allow-list, including
+`http://localhost:3000/auth/callback` for local development and the production
+`/auth/callback` URL for deployment. `NEXT_PUBLIC_SITE_URL` is optional and is
+used as a fallback origin for sign-in links when request headers are not
+available.
+
 `ASSEMBLYAI_BASE_URL` is optional and defaults to `https://api.assemblyai.com`.
 `OPENAI_BASE_URL` is optional and defaults to `https://api.openai.com/v1`.
 `OPENAI_WORKER_MODEL` is optional and defaults to `gpt-5-mini`.

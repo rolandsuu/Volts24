@@ -25,6 +25,7 @@ export type VideoUploadInput = {
   size: number;
   prompt: string;
   targetLanguage: string;
+  userId?: string;
   batchId?: string;
   batchPosition?: number;
 };
@@ -116,6 +117,10 @@ export async function createVideoUploadRecord(
 
   if (input.batchId) {
     insertRecord.batch_id = input.batchId;
+  }
+
+  if (input.userId) {
+    insertRecord.user_id = input.userId;
   }
 
   if (input.batchPosition !== undefined) {

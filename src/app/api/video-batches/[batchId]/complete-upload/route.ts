@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 
 import { normalizePrompt } from "@/lib/upload-records";
+import { AuthError } from "@/lib/auth";
+import { loadAccessibleBatch } from "@/lib/ownership";
 import {
   queueUploadSession,
   VideoProcessingQueueError,
@@ -43,10 +45,19 @@ export async function POST(
   const sharedPrompt = normalizePrompt(body.prompt);
 
   try {
+    await loadAccessibleBatch<{ user_id: string | null }>(
+      batchId,
+      "id,user_id"
+    );
+
     return NextResponse.json(
       await queueUploadSession(batchId, { prompt: sharedPrompt })
     );
   } catch (error) {
+    if (error instanceof AuthError) {
+      return errorResponse(error.message, error.status);
+    }
+
     if (error instanceof VideoProcessingQueueError) {
       return errorResponse(error.message, error.status);
     }

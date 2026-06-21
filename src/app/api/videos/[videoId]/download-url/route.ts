@@ -3,7 +3,8 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { NextResponse } from "next/server";
 
 import { r2, R2_BUCKET_NAME } from "@/lib/r2";
-import { supabaseAdmin } from "@/lib/supabase-admin";
+import { AuthError } from "@/lib/auth";
+import { loadAccessibleVideo } from "@/lib/ownership";
 
 export const runtime = "nodejs";
 
@@ -16,6 +17,7 @@ type DownloadContext = {
 type DownloadRow = {
   status: string;
   final_r2_key: string | null;
+  user_id: string | null;
 };
 
 function errorResponse(error: string, status: number) {
@@ -29,21 +31,23 @@ export async function GET(_request: Request, context: DownloadContext) {
     return errorResponse("Missing videoId", 400);
   }
 
-  const { data, error } = await supabaseAdmin
-    .from("videos")
-    .select("status,final_r2_key")
-    .eq("id", videoId)
-    .single();
+  let video: DownloadRow;
 
-  if (error) {
-    if (error.code === "PGRST116") {
-      return errorResponse("Video not found", 404);
+  try {
+    video = await loadAccessibleVideo<DownloadRow>(
+      videoId,
+      "status,final_r2_key,user_id"
+    );
+  } catch (error) {
+    if (error instanceof AuthError) {
+      return errorResponse(error.message, error.status);
     }
 
-    return errorResponse(`Failed to load video: ${error.message}`, 500);
-  }
+    const message =
+      error instanceof Error ? error.message : "Failed to load video";
 
-  const video = data as DownloadRow;
+    return errorResponse(message, 500);
+  }
 
   if (video.status !== "completed" || !video.final_r2_key) {
     return errorResponse("Video is not ready to download", 400);

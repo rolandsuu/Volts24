@@ -4,7 +4,8 @@ import { NextResponse } from "next/server";
 
 import type { InstructionDocumentArtifact } from "@/lib/instruction-document";
 import { r2, R2_BUCKET_NAME } from "@/lib/r2";
-import { supabaseAdmin } from "@/lib/supabase-admin";
+import { AuthError } from "@/lib/auth";
+import { loadAccessibleVideo } from "@/lib/ownership";
 
 export const runtime = "nodejs";
 
@@ -17,6 +18,7 @@ type InstructionDocumentContext = {
 type InstructionDocumentRow = {
   instruction_doc_r2_key: string | null;
   instruction_pdf_r2_key: string | null;
+  user_id: string | null;
 };
 
 type TransformableBody = {
@@ -98,21 +100,23 @@ export async function GET(
     return errorResponse("Missing videoId", 400);
   }
 
-  const { data, error } = await supabaseAdmin
-    .from("videos")
-    .select("instruction_doc_r2_key,instruction_pdf_r2_key")
-    .eq("id", videoId)
-    .single();
+  let video: InstructionDocumentRow;
 
-  if (error) {
-    if (error.code === "PGRST116") {
-      return errorResponse("Video not found", 404);
+  try {
+    video = await loadAccessibleVideo<InstructionDocumentRow>(
+      videoId,
+      "instruction_doc_r2_key,instruction_pdf_r2_key,user_id"
+    );
+  } catch (error) {
+    if (error instanceof AuthError) {
+      return errorResponse(error.message, error.status);
     }
 
-    return errorResponse(`Failed to load video: ${error.message}`, 500);
-  }
+    const message =
+      error instanceof Error ? error.message : "Failed to load video";
 
-  const video = data as InstructionDocumentRow;
+    return errorResponse(message, 500);
+  }
 
   if (!video.instruction_doc_r2_key || !video.instruction_pdf_r2_key) {
     return errorResponse("Instruction document is not ready", 409);

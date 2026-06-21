@@ -5,6 +5,7 @@ import {
   parseCreateUploadSessionBody,
   UploadValidationError,
 } from "@/lib/upload-sessions";
+import { AuthError, requireAuthenticatedUser } from "@/lib/auth";
 
 export const runtime = "nodejs";
 
@@ -29,12 +30,20 @@ export async function POST(request: Request) {
   }
 
   try {
+    const user = await requireAuthenticatedUser();
     const uploadSession = await createUploadSession(
-      parseCreateUploadSessionBody(body)
+      {
+        ...parseCreateUploadSessionBody(body),
+        userId: user.id,
+      }
     );
 
     return NextResponse.json(uploadSession);
   } catch (error) {
+    if (error instanceof AuthError) {
+      return errorResponse(error.message, error.status);
+    }
+
     if (error instanceof UploadValidationError) {
       return errorResponse(error.message, error.status);
     }

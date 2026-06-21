@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 
+import { AuthError } from "@/lib/auth";
+import { loadAccessibleVideo } from "@/lib/ownership";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 
 export const runtime = "nodejs";
@@ -16,6 +18,7 @@ type UploadFailedBody = {
 
 type VideoRow = {
   status: string;
+  user_id: string | null;
 };
 
 const MARK_FAILED_STATUSES = new Set(["created", "uploaded"]);
@@ -47,21 +50,20 @@ export async function POST(request: Request, context: UploadFailedContext) {
     body = {};
   }
 
-  const { data, error: selectError } = await supabaseAdmin
-    .from("videos")
-    .select("status")
-    .eq("id", videoId)
-    .single();
+  let video: VideoRow;
 
-  if (selectError) {
-    if (selectError.code === "PGRST116") {
-      return errorResponse("Video not found", 404);
+  try {
+    video = await loadAccessibleVideo<VideoRow>(videoId, "status,user_id");
+  } catch (error) {
+    if (error instanceof AuthError) {
+      return errorResponse(error.message, error.status);
     }
 
-    return errorResponse(`Failed to load video: ${selectError.message}`, 500);
-  }
+    const message =
+      error instanceof Error ? error.message : "Failed to load video";
 
-  const video = data as VideoRow;
+    return errorResponse(message, 500);
+  }
 
   if (!MARK_FAILED_STATUSES.has(video.status)) {
     return errorResponse(
