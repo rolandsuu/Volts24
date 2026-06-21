@@ -3,15 +3,15 @@ import { randomUUID } from "node:crypto";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
-import { r2, R2_BUCKET_NAME } from "@/lib/r2";
-import { supabaseAdmin } from "@/lib/supabase-admin";
+import { r2, R2_BUCKET_NAME } from "./r2.ts";
+import { supabaseAdmin } from "./supabase-admin.ts";
 
 export {
   DEFAULT_UPLOAD_PROMPT,
   MAX_BATCH_UPLOAD_FILES,
   getTrimmedString,
   normalizePrompt,
-} from "./upload-settings";
+} from "./upload-settings.ts";
 
 export const ACCEPTED_VIDEO_CONTENT_TYPES = new Set([
   "video/mp4",

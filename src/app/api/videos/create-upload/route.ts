@@ -2,10 +2,8 @@ import { NextResponse } from "next/server";
 
 import {
   UploadValidationError,
-  createVideoUploadRecord,
-  getTrimmedString,
-  normalizePrompt,
-} from "@/lib/upload-records";
+  createSingleVideoUploadSession,
+} from "@/lib/upload-sessions";
 
 export const runtime = "nodejs";
 
@@ -30,34 +28,8 @@ export async function POST(request: Request) {
     return errorResponse("Request body must be valid JSON", 400);
   }
 
-  const filename = getTrimmedString(body.filename);
-  const contentType = getTrimmedString(body.contentType);
-  const targetLanguage = getTrimmedString(body.targetLanguage);
-
-  if (!filename || !contentType || !targetLanguage) {
-    return errorResponse(
-      "Missing required fields: filename, contentType, and targetLanguage are required",
-      400
-    );
-  }
-
   try {
-    if (typeof body.size !== "number") {
-      return errorResponse("size must be a positive integer", 400);
-    }
-
-    const upload = await createVideoUploadRecord({
-      filename,
-      contentType,
-      size: body.size,
-      prompt: normalizePrompt(body.prompt),
-      targetLanguage,
-    });
-
-    return NextResponse.json({
-      videoId: upload.videoId,
-      uploadUrl: upload.uploadUrl,
-    });
+    return NextResponse.json(await createSingleVideoUploadSession(body));
   } catch (error) {
     if (error instanceof UploadValidationError) {
       return errorResponse(error.message, error.status);
