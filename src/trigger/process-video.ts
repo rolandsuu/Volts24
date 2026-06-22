@@ -23,6 +23,7 @@ import {
   type InstructionDocumentArtifact,
   type InstructionDocumentArtifactStep,
 } from "../lib/instruction-document";
+import { renderInstructionDocumentPdf } from "../lib/instruction-document-pdf";
 import {
   buildInstructionOverlayRenderPlan,
   getSelectedSegmentReferences,
@@ -150,6 +151,8 @@ type OpenAiResponsesResponse = {
   usage?: unknown;
 };
 
+type OpenAiReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh";
+type OpenAiImageDetail = "low" | "high" | "auto";
 type VideoAnalysisProvider = "twelvelabs" | "gemini" | "openai";
 type VideoStyle = "instruction_overlay" | "voiceover_subtitles";
 type FinalRenderer = "remotion" | "ffmpeg";
@@ -185,7 +188,9 @@ const ASSEMBLYAI_TRANSCRIPT_TIMEOUT_MS = 25 * 60 * 1000;
 const ASSEMBLYAI_POLL_INTERVAL_MS = 3000;
 const OPENAI_PROVIDER = "openai";
 const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
-const OPENAI_DEFAULT_MODEL = "gpt-5-mini";
+const OPENAI_DEFAULT_MODEL = "gpt-5.5";
+const OPENAI_DEFAULT_REASONING_EFFORT: OpenAiReasoningEffort = "high";
+const OPENAI_DEFAULT_IMAGE_DETAIL: OpenAiImageDetail = "high";
 const OPENAI_TTS_DEFAULT_MODEL = "gpt-4o-mini-tts";
 const OPENAI_TTS_DEFAULT_VOICE = "cedar";
 const OPENAI_TTS_OUTPUT_FORMAT = "mp3";
@@ -201,9 +206,11 @@ const GEMINI_FILE_PROCESSING_TIMEOUT_MS = 10 * 60 * 1000;
 const GEMINI_FILE_POLL_INTERVAL_MS = 3000;
 const DEFAULT_FRAME_SAMPLE_INTERVAL_SECONDS = 3;
 const DEFAULT_MAX_VISUAL_FRAMES = 30;
-const OPENAI_VISUAL_ANALYSIS_MAX_OUTPUT_TOKENS = 12000;
-const OPENAI_EDIT_PLAN_MAX_OUTPUT_TOKENS = 12000;
-const OPENAI_OVERLAY_PLAN_MAX_OUTPUT_TOKENS = 6000;
+const OPENAI_VISUAL_ANALYSIS_DEFAULT_MAX_OUTPUT_TOKENS = 20000;
+const OPENAI_EDIT_PLAN_DEFAULT_MAX_OUTPUT_TOKENS = 20000;
+const OPENAI_OVERLAY_PLAN_DEFAULT_MAX_OUTPUT_TOKENS = 10000;
+const OPENAI_INSTRUCTION_DOCUMENT_DEFAULT_MAX_OUTPUT_TOKENS = 12000;
+const OPENAI_VOICEOVER_SCRIPT_DEFAULT_MAX_OUTPUT_TOKENS = 6000;
 const GEMINI_VIDEO_EVENT_ANALYSIS_MAX_OUTPUT_TOKENS = 8000;
 const MAX_TRANSCRIPT_CONTEXT_CHARS = 6000;
 const MAX_EDIT_PLAN_UTTERANCES = 80;
@@ -219,15 +226,6 @@ const REMOTION_COMPOSITION_ID = "InstructionVideo";
 const REMOTION_FPS = 30;
 const MAX_INSTRUCTION_DOCUMENT_STEPS = 12;
 const INSTRUCTION_FRAME_WIDTH = 1280;
-const PDF_PAGE_WIDTH = 595.28;
-const PDF_PAGE_HEIGHT = 841.89;
-const PDF_MARGIN = 42;
-const PDF_LINE_HEIGHT = 16;
-const PDF_FONT_SIZE = 11;
-const PDF_TITLE_FONT_SIZE = 22;
-const PDF_HEADING_FONT_SIZE = 15;
-const PDF_IMAGE_WIDTH = PDF_PAGE_WIDTH - PDF_MARGIN * 2;
-const PDF_IMAGE_HEIGHT = 220;
 const SUBTITLE_FONTS_DIR = path.join(process.cwd(), "assets", "fonts");
 const VISUAL_TIMELINE_SCHEMA = {
   type: "object",
@@ -836,6 +834,31 @@ function getOutputVideoBitrate() {
   return getOptionalStringEnv("OUTPUT_VIDEO_BITRATE") ?? DEFAULT_OUTPUT_VIDEO_BITRATE;
 }
 
+function getOpenAiMaxOutputTokens() {
+  return {
+    visualAnalysis: getPositiveIntegerEnv(
+      "OPENAI_VISUAL_ANALYSIS_MAX_OUTPUT_TOKENS",
+      OPENAI_VISUAL_ANALYSIS_DEFAULT_MAX_OUTPUT_TOKENS
+    ),
+    editPlan: getPositiveIntegerEnv(
+      "OPENAI_EDIT_PLAN_MAX_OUTPUT_TOKENS",
+      OPENAI_EDIT_PLAN_DEFAULT_MAX_OUTPUT_TOKENS
+    ),
+    overlayPlan: getPositiveIntegerEnv(
+      "OPENAI_OVERLAY_PLAN_MAX_OUTPUT_TOKENS",
+      OPENAI_OVERLAY_PLAN_DEFAULT_MAX_OUTPUT_TOKENS
+    ),
+    instructionDocument: getPositiveIntegerEnv(
+      "OPENAI_INSTRUCTION_DOCUMENT_MAX_OUTPUT_TOKENS",
+      OPENAI_INSTRUCTION_DOCUMENT_DEFAULT_MAX_OUTPUT_TOKENS
+    ),
+    voiceoverScript: getPositiveIntegerEnv(
+      "OPENAI_VOICEOVER_SCRIPT_MAX_OUTPUT_TOKENS",
+      OPENAI_VOICEOVER_SCRIPT_DEFAULT_MAX_OUTPUT_TOKENS
+    ),
+  };
+}
+
 function getAssemblyAiConfig() {
   const apiKey = process.env.ASSEMBLYAI_API_KEY;
 
@@ -874,7 +897,18 @@ function getOpenAiConfig() {
     baseUrl: normalizeBaseUrl(
       process.env.OPENAI_BASE_URL ?? OPENAI_DEFAULT_BASE_URL
     ),
-    model: process.env.OPENAI_WORKER_MODEL ?? OPENAI_DEFAULT_MODEL,
+    model: getOptionalStringEnv("OPENAI_WORKER_MODEL") ?? OPENAI_DEFAULT_MODEL,
+    reasoningEffort: getEnumEnv<OpenAiReasoningEffort>(
+      "OPENAI_REASONING_EFFORT",
+      ["none", "low", "medium", "high", "xhigh"],
+      OPENAI_DEFAULT_REASONING_EFFORT
+    ),
+    imageDetail: getEnumEnv<OpenAiImageDetail>(
+      "OPENAI_IMAGE_DETAIL",
+      ["low", "high", "auto"],
+      OPENAI_DEFAULT_IMAGE_DETAIL
+    ),
+    maxOutputTokens: getOpenAiMaxOutputTokens(),
   };
 }
 
@@ -2356,7 +2390,8 @@ async function analyzeVisualTimeline(options: {
   intervalSeconds: number;
   maxFrames: number;
 }) {
-  const { apiKey, baseUrl, model } = getOpenAiConfig();
+  const { apiKey, baseUrl, model, reasoningEffort, imageDetail, maxOutputTokens } =
+    getOpenAiConfig();
   const content: Record<string, unknown>[] = [
     {
       type: "input_text",
@@ -2379,7 +2414,7 @@ async function analyzeVisualTimeline(options: {
     content.push({
       type: "input_image",
       image_url: `data:image/jpeg;base64,${frameBytes.toString("base64")}`,
-      detail: "low",
+      detail: imageDetail,
     });
   }
 
@@ -2391,6 +2426,7 @@ async function analyzeVisualTimeline(options: {
     },
     body: JSON.stringify({
       model,
+      reasoning: { effort: reasoningEffort },
       input: [
         {
           role: "user",
@@ -2405,7 +2441,7 @@ async function analyzeVisualTimeline(options: {
           schema: VISUAL_TIMELINE_SCHEMA,
         },
       },
-      max_output_tokens: OPENAI_VISUAL_ANALYSIS_MAX_OUTPUT_TOKENS,
+      max_output_tokens: maxOutputTokens.visualAnalysis,
       store: false,
     }),
   });
@@ -2790,7 +2826,8 @@ async function planTutorialSegments(options: {
   videoEventAnalysis?: VideoEventAnalysisArtifact | null;
   durationSeconds: number;
 }) {
-  const { apiKey, baseUrl, model } = getOpenAiConfig();
+  const { apiKey, baseUrl, model, reasoningEffort, maxOutputTokens } =
+    getOpenAiConfig();
   const response = await fetch(`${baseUrl}/responses`, {
     method: "POST",
     headers: {
@@ -2799,6 +2836,7 @@ async function planTutorialSegments(options: {
     },
     body: JSON.stringify({
       model,
+      reasoning: { effort: reasoningEffort },
       input: [
         {
           role: "user",
@@ -2818,7 +2856,7 @@ async function planTutorialSegments(options: {
           schema: EDIT_PLAN_SCHEMA,
         },
       },
-      max_output_tokens: OPENAI_EDIT_PLAN_MAX_OUTPUT_TOKENS,
+      max_output_tokens: maxOutputTokens.editPlan,
       store: false,
     }),
   });
@@ -3013,7 +3051,8 @@ async function planInstructionOverlays(options: {
     );
   }
 
-  const { apiKey, baseUrl, model } = getOpenAiConfig();
+  const { apiKey, baseUrl, model, reasoningEffort, maxOutputTokens } =
+    getOpenAiConfig();
   const response = await fetch(`${baseUrl}/responses`, {
     method: "POST",
     headers: {
@@ -3022,6 +3061,7 @@ async function planInstructionOverlays(options: {
     },
     body: JSON.stringify({
       model,
+      reasoning: { effort: reasoningEffort },
       input: [
         {
           role: "user",
@@ -3041,7 +3081,7 @@ async function planInstructionOverlays(options: {
           schema: INSTRUCTION_OVERLAY_PLAN_SCHEMA,
         },
       },
-      max_output_tokens: OPENAI_OVERLAY_PLAN_MAX_OUTPUT_TOKENS,
+      max_output_tokens: maxOutputTokens.overlayPlan,
       store: false,
     }),
   });
@@ -3178,6 +3218,11 @@ function buildInstructionDocumentInstructions(options: {
     "Each step must reference exactly one key frame from the provided sampled frame list.",
     "For keyFrame.timestampSeconds, copy the exact timestamp for the referenced visualFrameIndex.",
     "Use the edit plan as the source of truth for the step order and supporting source ranges.",
+    "Write the document as a customer handoff guide that can be shared outside the company.",
+    "Each step needs a concrete instruction plus 1-4 practical cautions for things the customer should be careful with.",
+    "Cautions must be grounded in the visible action, transcript, or edit plan. Do not invent legal, medical, or safety hazards that are not evidenced.",
+    "The checklist must contain 3-8 final checks the customer should complete after all steps.",
+    "Use warnings only for source limitations or uncertainty, not normal step cautions.",
     `Return at most ${MAX_INSTRUCTION_DOCUMENT_STEPS} instruction steps.`,
     "",
     `User prompt: ${options.prompt}`,
@@ -3223,7 +3268,8 @@ async function generateInstructionDocument(options: {
   sampledFrames: SampledFrame[];
   durationSeconds: number;
 }) {
-  const { apiKey, baseUrl, model } = getOpenAiConfig();
+  const { apiKey, baseUrl, model, reasoningEffort, maxOutputTokens } =
+    getOpenAiConfig();
   const response = await fetch(`${baseUrl}/responses`, {
     method: "POST",
     headers: {
@@ -3232,6 +3278,7 @@ async function generateInstructionDocument(options: {
     },
     body: JSON.stringify({
       model,
+      reasoning: { effort: reasoningEffort },
       input: [
         {
           role: "user",
@@ -3251,7 +3298,7 @@ async function generateInstructionDocument(options: {
           schema: INSTRUCTION_DOCUMENT_SCHEMA,
         },
       },
-      max_output_tokens: 5000,
+      max_output_tokens: maxOutputTokens.instructionDocument,
       store: false,
     }),
   });
@@ -3616,7 +3663,8 @@ async function generateVoiceoverScript(options: {
   editPlan: EditPlanArtifact;
   brandLanguageContext: BrandLanguageContext;
 }) {
-  const { apiKey, baseUrl, model } = getOpenAiConfig();
+  const { apiKey, baseUrl, model, reasoningEffort, maxOutputTokens } =
+    getOpenAiConfig();
   const selectedDurationSeconds = getSelectedDurationSeconds(options.editPlan);
   const response = await fetch(`${baseUrl}/responses`, {
     method: "POST",
@@ -3626,6 +3674,7 @@ async function generateVoiceoverScript(options: {
     },
     body: JSON.stringify({
       model,
+      reasoning: { effort: reasoningEffort },
       input: [
         {
           role: "user",
@@ -3653,7 +3702,7 @@ async function generateVoiceoverScript(options: {
           schema: VOICEOVER_SCRIPT_SCHEMA,
         },
       },
-      max_output_tokens: 3000,
+      max_output_tokens: maxOutputTokens.voiceoverScript,
       store: false,
     }),
   });
@@ -4534,465 +4583,10 @@ function buildInstructionDocumentArtifact(options: {
     overview: options.document.overview,
     targetLanguage: options.document.targetLanguage,
     steps,
+    checklist: options.document.checklist,
     warnings: options.document.warnings,
     rawResponse: options.rawResponse,
   };
-}
-
-function getJpegDimensions(data: Buffer) {
-  let offset = 2;
-
-  while (offset + 9 < data.length) {
-    if (data[offset] !== 0xff) {
-      offset += 1;
-      continue;
-    }
-
-    const marker = data[offset + 1];
-    const blockLength = data.readUInt16BE(offset + 2);
-    const isStartOfFrame =
-      (marker >= 0xc0 && marker <= 0xc3) ||
-      (marker >= 0xc5 && marker <= 0xc7) ||
-      (marker >= 0xc9 && marker <= 0xcb) ||
-      (marker >= 0xcd && marker <= 0xcf);
-
-    if (isStartOfFrame) {
-      return {
-        height: data.readUInt16BE(offset + 5),
-        width: data.readUInt16BE(offset + 7),
-      };
-    }
-
-    if (blockLength <= 0) {
-      break;
-    }
-
-    offset += 2 + blockLength;
-  }
-
-  return {
-    width: INSTRUCTION_FRAME_WIDTH,
-    height: Math.round((INSTRUCTION_FRAME_WIDTH * 9) / 16),
-  };
-}
-
-function encodePdfUtf16BeHex(text: string) {
-  const utf16Le = Buffer.from(text, "utf16le");
-  const utf16Be = Buffer.alloc(utf16Le.length);
-
-  for (let index = 0; index < utf16Le.length; index += 2) {
-    utf16Be[index] = utf16Le[index + 1];
-    utf16Be[index + 1] = utf16Le[index];
-  }
-
-  return `<${utf16Be.toString("hex").toUpperCase()}>`;
-}
-
-function pdfNumber(value: number) {
-  return value.toFixed(2);
-}
-
-function estimatePdfTextWidth(text: string, fontSize: number) {
-  let units = 0;
-
-  for (const character of text) {
-    units += character.charCodeAt(0) < 128 ? 0.55 : 1;
-  }
-
-  return units * fontSize;
-}
-
-function wrapPdfText(text: string, maxWidth: number, fontSize: number) {
-  const lines: string[] = [];
-
-  for (const paragraph of text.split(/\r?\n/)) {
-    let currentLine = "";
-
-    for (const character of paragraph) {
-      const candidate = `${currentLine}${character}`;
-
-      if (currentLine && estimatePdfTextWidth(candidate, fontSize) > maxWidth) {
-        lines.push(currentLine.trimEnd());
-        currentLine = character.trimStart();
-      } else {
-        currentLine = candidate;
-      }
-    }
-
-    if (currentLine.trim()) {
-      lines.push(currentLine.trimEnd());
-    }
-  }
-
-  return lines.length > 0 ? lines : [""];
-}
-
-type PdfImageResource = {
-  name: string;
-  data: Buffer;
-  width: number;
-  height: number;
-};
-
-type PdfPage = {
-  operations: string[];
-  imageNames: string[];
-};
-
-class SimplePdfBuilder {
-  private pages: PdfPage[] = [];
-  private images: PdfImageResource[] = [];
-  private currentPage: PdfPage;
-  private y = PDF_MARGIN;
-  private imageCounter = 0;
-
-  constructor() {
-    this.currentPage = this.createPage();
-  }
-
-  private createPage() {
-    const page: PdfPage = {
-      operations: [],
-      imageNames: [],
-    };
-    this.pages.push(page);
-    this.y = PDF_MARGIN;
-    return page;
-  }
-
-  private ensureSpace(height: number) {
-    if (this.y + height > PDF_PAGE_HEIGHT - PDF_MARGIN) {
-      this.currentPage = this.createPage();
-    }
-  }
-
-  addText(text: string, options: { fontSize?: number; lineHeight?: number } = {}) {
-    const fontSize = options.fontSize ?? PDF_FONT_SIZE;
-    const lineHeight = options.lineHeight ?? PDF_LINE_HEIGHT;
-    const lines = wrapPdfText(text, PDF_IMAGE_WIDTH, fontSize);
-
-    this.ensureSpace(lines.length * lineHeight + 4);
-
-    for (const line of lines) {
-      const baselineY = PDF_PAGE_HEIGHT - this.y;
-      this.currentPage.operations.push(
-        [
-          "BT",
-          "/F1",
-          pdfNumber(fontSize),
-          "Tf",
-          "0 0 0 rg",
-          "1 0 0 1",
-          pdfNumber(PDF_MARGIN),
-          pdfNumber(baselineY),
-          "Tm",
-          encodePdfUtf16BeHex(line),
-          "Tj",
-          "ET",
-        ].join(" ")
-      );
-      this.y += lineHeight;
-    }
-
-    this.y += 4;
-  }
-
-  addSpacer(height: number) {
-    this.ensureSpace(height);
-    this.y += height;
-  }
-
-  async addImage(filePath: string) {
-    const data = await readFile(filePath);
-    const dimensions = getJpegDimensions(data);
-    const scale = Math.min(
-      PDF_IMAGE_WIDTH / dimensions.width,
-      PDF_IMAGE_HEIGHT / dimensions.height
-    );
-    const drawWidth = dimensions.width * scale;
-    const drawHeight = dimensions.height * scale;
-
-    this.ensureSpace(drawHeight + 12);
-
-    this.imageCounter += 1;
-    const name = `Im${this.imageCounter}`;
-    const image: PdfImageResource = {
-      name,
-      data,
-      width: dimensions.width,
-      height: dimensions.height,
-    };
-    const x = PDF_MARGIN + (PDF_IMAGE_WIDTH - drawWidth) / 2;
-    const y = PDF_PAGE_HEIGHT - this.y - drawHeight;
-
-    this.images.push(image);
-    this.currentPage.imageNames.push(name);
-    this.currentPage.operations.push(
-      [
-        "q",
-        pdfNumber(drawWidth),
-        "0 0",
-        pdfNumber(drawHeight),
-        pdfNumber(x),
-        pdfNumber(y),
-        "cm",
-        `/${name}`,
-        "Do",
-        "Q",
-      ].join(" ")
-    );
-    this.y += drawHeight + 12;
-  }
-
-  buildBuffer() {
-    return buildPdfBuffer({
-      pages: this.pages,
-      images: this.images,
-    });
-  }
-}
-
-function buildPdfBuffer(options: {
-  pages: PdfPage[];
-  images: PdfImageResource[];
-}) {
-  const catalogObjectId = 1;
-  const pagesObjectId = 2;
-  const fontObjectId = 3;
-  const fontDescendantObjectId = 4;
-  let nextObjectId = 5;
-  const imageObjectIds = new Map<string, number>();
-
-  for (const image of options.images) {
-    imageObjectIds.set(image.name, nextObjectId);
-    nextObjectId += 1;
-  }
-
-  const contentObjectIds = options.pages.map(() => {
-    const id = nextObjectId;
-    nextObjectId += 1;
-    return id;
-  });
-  const pageObjectIds = options.pages.map(() => {
-    const id = nextObjectId;
-    nextObjectId += 1;
-    return id;
-  });
-  const objects = new Map<number, Buffer>();
-
-  function setTextObject(id: number, content: string) {
-    objects.set(id, Buffer.from(content, "utf8"));
-  }
-
-  function setStreamObject(id: number, dictionary: string, data: Buffer) {
-    objects.set(
-      id,
-      Buffer.concat([
-        Buffer.from(`<< ${dictionary} /Length ${data.length} >>\nstream\n`),
-        data,
-        Buffer.from("\nendstream"),
-      ])
-    );
-  }
-
-  setTextObject(
-    fontDescendantObjectId,
-    [
-      "<<",
-      "/Type /Font",
-      "/Subtype /CIDFontType0",
-      "/BaseFont /STSong-Light",
-      "/CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 2 >>",
-      "/DW 1000",
-      ">>",
-    ].join(" ")
-  );
-  setTextObject(
-    fontObjectId,
-    [
-      "<<",
-      "/Type /Font",
-      "/Subtype /Type0",
-      "/BaseFont /STSong-Light",
-      "/Encoding /UniGB-UCS2-H",
-      `/DescendantFonts [${fontDescendantObjectId} 0 R]`,
-      ">>",
-    ].join(" ")
-  );
-
-  for (const image of options.images) {
-    const imageObjectId = imageObjectIds.get(image.name);
-
-    if (!imageObjectId) {
-      continue;
-    }
-
-    setStreamObject(
-      imageObjectId,
-      [
-        "/Type /XObject",
-        "/Subtype /Image",
-        `/Width ${image.width}`,
-        `/Height ${image.height}`,
-        "/ColorSpace /DeviceRGB",
-        "/BitsPerComponent 8",
-        "/Filter /DCTDecode",
-      ].join(" "),
-      image.data
-    );
-  }
-
-  for (const [index, page] of options.pages.entries()) {
-    const content = Buffer.from(page.operations.join("\n"), "utf8");
-    const contentObjectId = contentObjectIds[index];
-    const pageObjectId = pageObjectIds[index];
-    const xObjects = page.imageNames
-      .map((name) => {
-        const imageObjectId = imageObjectIds.get(name);
-
-        return imageObjectId ? `/${name} ${imageObjectId} 0 R` : null;
-      })
-      .filter((entry): entry is string => Boolean(entry))
-      .join(" ");
-    const resourceParts = [
-      `/Font << /F1 ${fontObjectId} 0 R >>`,
-      xObjects ? `/XObject << ${xObjects} >>` : null,
-    ].filter((part): part is string => Boolean(part));
-
-    setStreamObject(contentObjectId, "", content);
-    setTextObject(
-      pageObjectId,
-      [
-        "<<",
-        "/Type /Page",
-        `/Parent ${pagesObjectId} 0 R`,
-        `/MediaBox [0 0 ${PDF_PAGE_WIDTH} ${PDF_PAGE_HEIGHT}]`,
-        `/Resources << ${resourceParts.join(" ")} >>`,
-        `/Contents ${contentObjectId} 0 R`,
-        ">>",
-      ].join(" ")
-    );
-  }
-
-  setTextObject(
-    pagesObjectId,
-    [
-      "<<",
-      "/Type /Pages",
-      `/Kids [${pageObjectIds.map((id) => `${id} 0 R`).join(" ")}]`,
-      `/Count ${pageObjectIds.length}`,
-      ">>",
-    ].join(" ")
-  );
-  setTextObject(
-    catalogObjectId,
-    `<< /Type /Catalog /Pages ${pagesObjectId} 0 R >>`
-  );
-
-  const header = Buffer.from("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n", "binary");
-  const chunks: Buffer[] = [header];
-  const offsets = [0];
-  let offset = header.length;
-
-  for (let objectId = 1; objectId < nextObjectId; objectId += 1) {
-    const objectBody = objects.get(objectId);
-
-    if (!objectBody) {
-      throw new Error(`PDF object ${objectId} was not written`);
-    }
-
-    const objectBuffer = Buffer.concat([
-      Buffer.from(`${objectId} 0 obj\n`),
-      objectBody,
-      Buffer.from("\nendobj\n"),
-    ]);
-
-    offsets[objectId] = offset;
-    chunks.push(objectBuffer);
-    offset += objectBuffer.length;
-  }
-
-  const xrefOffset = offset;
-  const xrefLines = [
-    "xref",
-    `0 ${nextObjectId}`,
-    "0000000000 65535 f ",
-    ...offsets
-      .slice(1)
-      .map((item) => `${String(item).padStart(10, "0")} 00000 n `),
-    "trailer",
-    `<< /Size ${nextObjectId} /Root ${catalogObjectId} 0 R >>`,
-    "startxref",
-    String(xrefOffset),
-    "%%EOF",
-    "",
-  ];
-
-  chunks.push(Buffer.from(xrefLines.join("\n"), "utf8"));
-
-  return Buffer.concat(chunks);
-}
-
-function formatInstructionTimestamp(seconds: number) {
-  const totalSeconds = Math.max(0, Math.round(seconds));
-  const minutes = Math.floor(totalSeconds / 60);
-  const remainingSeconds = totalSeconds % 60;
-
-  return `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
-}
-
-async function renderInstructionDocumentPdf(options: {
-  document: InstructionDocumentArtifact;
-  frameAssets: InstructionFrameAsset[];
-  outputPath: string;
-}) {
-  const builder = new SimplePdfBuilder();
-  const frameAssetByStepIndex = new Map(
-    options.frameAssets.map((asset) => [asset.stepIndex, asset])
-  );
-
-  builder.addText(options.document.title, {
-    fontSize: PDF_TITLE_FONT_SIZE,
-    lineHeight: 28,
-  });
-  builder.addText(options.document.overview);
-  builder.addSpacer(8);
-
-  for (const step of options.document.steps) {
-    const frameAsset = frameAssetByStepIndex.get(step.stepIndex);
-
-    builder.addText(`${step.stepIndex}. ${step.title}`, {
-      fontSize: PDF_HEADING_FONT_SIZE,
-      lineHeight: 20,
-    });
-
-    if (frameAsset) {
-      await builder.addImage(frameAsset.filePath);
-    }
-
-    builder.addText(step.instruction);
-    builder.addText(
-      `Timestamp: ${formatInstructionTimestamp(step.timestampSeconds)}`
-    );
-    builder.addSpacer(10);
-  }
-
-  if (options.document.warnings.length > 0) {
-    builder.addText("Warnings", {
-      fontSize: PDF_HEADING_FONT_SIZE,
-      lineHeight: 20,
-    });
-
-    for (const warning of options.document.warnings) {
-      builder.addText(`- ${warning}`);
-    }
-  }
-
-  await writeFile(options.outputPath, builder.buildBuffer());
-  await assertNonEmptyFile(options.outputPath, {
-    code: "instruction_pdf_empty",
-    message: "Instruction document PDF was empty",
-  });
 }
 
 function toWorkerError(error: unknown) {

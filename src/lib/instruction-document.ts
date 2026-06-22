@@ -13,6 +13,7 @@ export type InstructionDocumentStep = {
   stepIndex: number;
   title: string;
   instruction: string;
+  cautions: string[];
   timestampSeconds: number;
   sourceStartSeconds: number;
   sourceEndSeconds: number;
@@ -24,6 +25,7 @@ export type InstructionDocument = {
   overview: string;
   targetLanguage: string;
   steps: InstructionDocumentStep[];
+  checklist: string[];
   warnings: string[];
 };
 
@@ -72,7 +74,14 @@ export class InstructionDocumentValidationError extends Error {
 export const INSTRUCTION_DOCUMENT_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["title", "overview", "targetLanguage", "steps", "warnings"],
+  required: [
+    "title",
+    "overview",
+    "targetLanguage",
+    "steps",
+    "checklist",
+    "warnings",
+  ],
   properties: {
     title: {
       type: "string",
@@ -98,6 +107,7 @@ export const INSTRUCTION_DOCUMENT_SCHEMA = {
           "stepIndex",
           "title",
           "instruction",
+          "cautions",
           "timestampSeconds",
           "sourceStartSeconds",
           "sourceEndSeconds",
@@ -117,6 +127,14 @@ export const INSTRUCTION_DOCUMENT_SCHEMA = {
             type: "string",
             description:
               "Plain-language instruction for this step. No markdown or HTML.",
+          },
+          cautions: {
+            type: "array",
+            minItems: 1,
+            maxItems: 4,
+            items: { type: "string" },
+            description:
+              "Customer-facing things to be careful with for this exact step. Keep them practical and evidence-based.",
           },
           timestampSeconds: {
             type: "number",
@@ -160,6 +178,14 @@ export const INSTRUCTION_DOCUMENT_SCHEMA = {
         },
       },
     },
+    checklist: {
+      type: "array",
+      minItems: 3,
+      maxItems: 8,
+      items: { type: "string" },
+      description:
+        "Final customer handoff checklist. These are concrete checks the customer should complete after following all steps.",
+    },
     warnings: {
       type: "array",
       items: { type: "string" },
@@ -173,12 +199,14 @@ const TOP_LEVEL_KEYS = new Set([
   "overview",
   "targetLanguage",
   "steps",
+  "checklist",
   "warnings",
 ]);
 const STEP_KEYS = new Set([
   "stepIndex",
   "title",
   "instruction",
+  "cautions",
   "timestampSeconds",
   "sourceStartSeconds",
   "sourceEndSeconds",
@@ -196,6 +224,8 @@ const STRING_LIMITS = {
   targetLanguage: 32,
   stepTitle: 120,
   instruction: 1800,
+  caution: 500,
+  checklistItem: 500,
   altText: 240,
   warning: 500,
 } as const;
@@ -206,6 +236,9 @@ const SCRIPT_URL_PATTERN = /\b(?:javascript|data)\s*:/i;
 const EVENT_HANDLER_PATTERN = /\bon[a-z]+\s*=/i;
 const FRAME_TIMESTAMP_TOLERANCE_SECONDS = 0.05;
 const DEFAULT_MAX_STEPS = 20;
+const MAX_STEP_CAUTIONS = 4;
+const MIN_CHECKLIST_ITEMS = 3;
+const MAX_CHECKLIST_ITEMS = 8;
 
 function fail(message: string): never {
   throw new InstructionDocumentValidationError(message);
@@ -287,6 +320,38 @@ function validateStepIndex(value: unknown, expectedIndex: number) {
   }
 
   return value;
+}
+
+function validateStringArray(
+  value: unknown,
+  fieldName: string,
+  options: {
+    minItems?: number;
+    maxItems?: number;
+    maxStringLength: number;
+  }
+) {
+  if (!Array.isArray(value)) {
+    fail(`${fieldName} must be an array`);
+  }
+
+  if (
+    typeof options.minItems === "number" &&
+    value.length < options.minItems
+  ) {
+    fail(`${fieldName} must contain at least ${options.minItems} item(s)`);
+  }
+
+  if (
+    typeof options.maxItems === "number" &&
+    value.length > options.maxItems
+  ) {
+    fail(`${fieldName} must contain ${options.maxItems} or fewer item(s)`);
+  }
+
+  return value.map((item, index) =>
+    validateSafeString(item, `${fieldName}[${index}]`, options.maxStringLength)
+  );
 }
 
 export function normalizeInstructionLanguage(value: string) {
@@ -446,6 +511,11 @@ export function validateInstructionDocument(
         `${fieldPrefix}.instruction`,
         STRING_LIMITS.instruction
       ),
+      cautions: validateStringArray(rawStep.cautions, `${fieldPrefix}.cautions`, {
+        minItems: 1,
+        maxItems: MAX_STEP_CAUTIONS,
+        maxStringLength: STRING_LIMITS.caution,
+      }),
       timestampSeconds,
       sourceStartSeconds,
       sourceEndSeconds,
@@ -461,13 +531,14 @@ export function validateInstructionDocument(
     };
   });
 
-  if (!Array.isArray(value.warnings)) {
-    fail("warnings must be an array");
-  }
-
-  const warnings = value.warnings.map((warning, index) =>
-    validateSafeString(warning, `warnings[${index}]`, STRING_LIMITS.warning)
-  );
+  const checklist = validateStringArray(value.checklist, "checklist", {
+    minItems: MIN_CHECKLIST_ITEMS,
+    maxItems: MAX_CHECKLIST_ITEMS,
+    maxStringLength: STRING_LIMITS.checklistItem,
+  });
+  const warnings = validateStringArray(value.warnings, "warnings", {
+    maxStringLength: STRING_LIMITS.warning,
+  });
 
   return {
     title: validateSafeString(value.title, "title", STRING_LIMITS.title),
@@ -478,6 +549,7 @@ export function validateInstructionDocument(
     ),
     targetLanguage,
     steps,
+    checklist,
     warnings,
   };
 }

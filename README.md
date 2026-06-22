@@ -15,7 +15,14 @@ R2_ENDPOINT=
 TRIGGER_SECRET_KEY=
 ASSEMBLYAI_API_KEY=
 OPENAI_API_KEY=
-OPENAI_WORKER_MODEL=gpt-5-mini
+OPENAI_WORKER_MODEL=gpt-5.5
+OPENAI_REASONING_EFFORT=high
+OPENAI_IMAGE_DETAIL=high
+OPENAI_VISUAL_ANALYSIS_MAX_OUTPUT_TOKENS=20000
+OPENAI_EDIT_PLAN_MAX_OUTPUT_TOKENS=20000
+OPENAI_OVERLAY_PLAN_MAX_OUTPUT_TOKENS=10000
+OPENAI_INSTRUCTION_DOCUMENT_MAX_OUTPUT_TOKENS=12000
+OPENAI_VOICEOVER_SCRIPT_MAX_OUTPUT_TOKENS=6000
 OPENAI_TTS_MODEL=gpt-4o-mini-tts
 OPENAI_TTS_VOICE=cedar
 VIDEO_ANALYSIS_PROVIDER=openai
@@ -49,7 +56,15 @@ processing services.
 
 `ASSEMBLYAI_BASE_URL` is optional and defaults to `https://api.assemblyai.com`.
 `OPENAI_BASE_URL` is optional and defaults to `https://api.openai.com/v1`.
-`OPENAI_WORKER_MODEL` is optional and defaults to `gpt-5-mini`.
+`OPENAI_WORKER_MODEL` is optional and defaults to `gpt-5.5`.
+`OPENAI_REASONING_EFFORT` is optional and defaults to `high` for worker
+Responses API calls. Supported values are `none`, `low`, `medium`, `high`, and
+`xhigh`; higher values can improve complex planning quality but usually increase
+latency and token cost. `OPENAI_IMAGE_DETAIL` is optional and defaults to
+`high` for sampled-frame visual analysis; supported values are `low`, `high`,
+and `auto`. The `OPENAI_*_MAX_OUTPUT_TOKENS` settings are optional per-stage
+limits for OpenAI Responses output, including reasoning tokens, and default to
+the values shown in the required environment example above.
 `OPENAI_TTS_MODEL` is optional and defaults to `gpt-4o-mini-tts`.
 `OPENAI_TTS_VOICE` is optional and defaults to `cedar`.
 `OPENAI_TTS_INSTRUCTIONS` is optional and can provide voice style guidance for

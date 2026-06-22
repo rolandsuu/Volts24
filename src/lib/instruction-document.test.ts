@@ -25,6 +25,7 @@ function validDocument(
         stepIndex: 1,
         title: "Open the upload screen",
         instruction: "Choose the source video and confirm the prompt.",
+        cautions: ["Confirm the selected video is the intended source file."],
         timestampSeconds: 4.5,
         sourceStartSeconds: 3,
         sourceEndSeconds: 6,
@@ -34,6 +35,11 @@ function validDocument(
           altText: "The upload controls are visible.",
         },
       },
+    ],
+    checklist: [
+      "Confirm every required file was selected.",
+      "Confirm the prompt matches the desired output.",
+      "Confirm the result is ready before sharing.",
     ],
     warnings: ["Frame sampling may miss very quick transitions."],
     ...overrides,
@@ -54,6 +60,8 @@ test("validateInstructionDocument accepts and trims a valid document", () => {
   assert.equal(document.title, "Make a product demo");
   assert.equal(document.targetLanguage, "zh");
   assert.equal(document.steps.length, 1);
+  assert.equal(document.steps[0].cautions.length, 1);
+  assert.equal(document.checklist.length, 3);
   assert.equal(document.steps[0].keyFrame.visualFrameIndex, 2);
 });
 
@@ -72,6 +80,30 @@ test("validateInstructionDocument rejects empty steps", () => {
   assert.throws(
     () => validate(validDocument({ steps: [] })),
     /steps must contain at least one step/
+  );
+});
+
+test("validateInstructionDocument rejects empty step cautions", () => {
+  assert.throws(
+    () =>
+      validate(
+        validDocument({
+          steps: [
+            {
+              ...validDocument().steps[0],
+              cautions: [],
+            },
+          ],
+        })
+      ),
+    /cautions must contain at least 1 item/
+  );
+});
+
+test("validateInstructionDocument rejects short final checklists", () => {
+  assert.throws(
+    () => validate(validDocument({ checklist: ["Confirm the result."] })),
+    /checklist must contain at least 3 item/
   );
 });
 
@@ -122,6 +154,23 @@ test("validateInstructionDocument rejects unknown frame references", () => {
 test("validateInstructionDocument rejects unsafe strings", () => {
   assert.throws(
     () => validate(validDocument({ overview: "<script>alert(1)</script>" })),
+    /unsafe markup-like text/
+  );
+});
+
+test("validateInstructionDocument rejects unsafe customer cautions", () => {
+  assert.throws(
+    () =>
+      validate(
+        validDocument({
+          steps: [
+            {
+              ...validDocument().steps[0],
+              cautions: ["Click <button>Start</button>."],
+            },
+          ],
+        })
+      ),
     /unsafe markup-like text/
   );
 });
