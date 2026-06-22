@@ -1,4 +1,4 @@
-import { task } from "@trigger.dev/sdk/v3";
+import { retry, task } from "@trigger.dev/sdk/v3";
 import { GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import {
@@ -24,6 +24,7 @@ import {
   type InstructionDocumentArtifactStep,
 } from "../lib/instruction-document";
 import { renderInstructionDocumentPdf } from "../lib/instruction-document-pdf";
+import { getOpenAiErrorMessage } from "../lib/openai-error";
 import {
   buildInstructionOverlayRenderPlan,
   getSelectedSegmentReferences,
@@ -194,6 +195,33 @@ const OPENAI_DEFAULT_IMAGE_DETAIL: OpenAiImageDetail = "high";
 const OPENAI_TTS_DEFAULT_MODEL = "gpt-4o-mini-tts";
 const OPENAI_TTS_DEFAULT_VOICE = "cedar";
 const OPENAI_TTS_OUTPUT_FORMAT = "mp3";
+const OPENAI_FETCH_TIMEOUT_MS = 10 * 60 * 1000;
+const OPENAI_FETCH_RETRY_OPTIONS = {
+  byStatus: {
+    "429,408,409,5xx": {
+      strategy: "backoff",
+      maxAttempts: 3,
+      factor: 2,
+      minTimeoutInMs: 1000,
+      maxTimeoutInMs: 30_000,
+      randomize: true,
+    },
+  },
+  connectionError: {
+    maxAttempts: 3,
+    factor: 2,
+    minTimeoutInMs: 1000,
+    maxTimeoutInMs: 30_000,
+    randomize: true,
+  },
+  timeout: {
+    maxAttempts: 3,
+    factor: 2,
+    minTimeoutInMs: 1000,
+    maxTimeoutInMs: 30_000,
+    randomize: true,
+  },
+} as const;
 const TWELVELABS_PROVIDER = "twelvelabs";
 const TWELVELABS_DEFAULT_BASE_URL = "https://api.twelvelabs.io/v1.3";
 const TWELVELABS_DEFAULT_MODEL = "pegasus1.5";
@@ -1098,6 +1126,34 @@ async function readJsonResponse(response: Response) {
   }
 }
 
+async function fetchOpenAi(
+  input: string,
+  init: RequestInit,
+  options: {
+    code: string;
+    failureMessage: string;
+  }
+) {
+  try {
+    return await retry.fetch(input, {
+      ...init,
+      timeoutInMs: OPENAI_FETCH_TIMEOUT_MS,
+      retry: OPENAI_FETCH_RETRY_OPTIONS,
+    });
+  } catch (error) {
+    const detail =
+      error instanceof Error && error.message !== "Fetch error"
+        ? `: ${error.message}`
+        : "";
+
+    throw new WorkerError(`${options.failureMessage}${detail}`, {
+      code: options.code,
+      provider: OPENAI_PROVIDER,
+      retryable: true,
+    });
+  }
+}
+
 function getProviderRequestId(response: Response) {
   return (
     response.headers.get("x-request-id") ??
@@ -1464,30 +1520,6 @@ async function sampleFrames(
     maxFrames,
     frames: sampledFrames,
   };
-}
-
-function getOpenAiErrorMessage(body: unknown, fallback: string) {
-  if (body && typeof body === "object" && "error" in body) {
-    const error = (body as { error?: unknown }).error;
-
-    if (typeof error === "string" && error.trim()) {
-      return error;
-    }
-
-    if (error && typeof error === "object" && "message" in error) {
-      const message = (error as { message?: unknown }).message;
-
-      if (typeof message === "string" && message.trim()) {
-        return message;
-      }
-    }
-  }
-
-  if (typeof body === "string" && body.trim()) {
-    return body;
-  }
-
-  return fallback;
 }
 
 function extractOpenAiOutputText(body: OpenAiResponsesResponse) {
@@ -2478,33 +2510,40 @@ async function analyzeVisualTimeline(options: {
     });
   }
 
-  const response = await fetch(`${baseUrl}/responses`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      reasoning: { effort: reasoningEffort },
-      input: [
-        {
-          role: "user",
-          content,
-        },
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          name: "visual_timeline",
-          strict: true,
-          schema: VISUAL_TIMELINE_SCHEMA,
-        },
+  const response = await fetchOpenAi(
+    `${baseUrl}/responses`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
       },
-      max_output_tokens: maxOutputTokens.visualAnalysis,
-      store: false,
-    }),
-  });
+      body: JSON.stringify({
+        model,
+        reasoning: { effort: reasoningEffort },
+        input: [
+          {
+            role: "user",
+            content,
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "visual_timeline",
+            strict: true,
+            schema: VISUAL_TIMELINE_SCHEMA,
+          },
+        },
+        max_output_tokens: maxOutputTokens.visualAnalysis,
+        store: false,
+      }),
+    },
+    {
+      code: "openai_visual_analysis_failed",
+      failureMessage: "OpenAI visual analysis request failed after retries",
+    }
+  );
 
   const body = (await readJsonResponse(response)) as OpenAiResponsesResponse;
   const requestId = getProviderRequestId(response);
@@ -2888,38 +2927,45 @@ async function planTutorialSegments(options: {
 }) {
   const { apiKey, baseUrl, model, reasoningEffort, maxOutputTokens } =
     getOpenAiConfig();
-  const response = await fetch(`${baseUrl}/responses`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      reasoning: { effort: reasoningEffort },
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: buildEditPlanInstructions(options),
-            },
-          ],
-        },
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          name: "tutorial_edit_plan",
-          strict: true,
-          schema: EDIT_PLAN_SCHEMA,
-        },
+  const response = await fetchOpenAi(
+    `${baseUrl}/responses`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
       },
-      max_output_tokens: maxOutputTokens.editPlan,
-      store: false,
-    }),
-  });
+      body: JSON.stringify({
+        model,
+        reasoning: { effort: reasoningEffort },
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: buildEditPlanInstructions(options),
+              },
+            ],
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "tutorial_edit_plan",
+            strict: true,
+            schema: EDIT_PLAN_SCHEMA,
+          },
+        },
+        max_output_tokens: maxOutputTokens.editPlan,
+        store: false,
+      }),
+    },
+    {
+      code: "openai_edit_plan_failed",
+      failureMessage: "OpenAI edit planning request failed after retries",
+    }
+  );
 
   const body = (await readJsonResponse(response)) as OpenAiResponsesResponse;
   const requestId = getProviderRequestId(response);
@@ -3113,38 +3159,46 @@ async function planInstructionOverlays(options: {
 
   const { apiKey, baseUrl, model, reasoningEffort, maxOutputTokens } =
     getOpenAiConfig();
-  const response = await fetch(`${baseUrl}/responses`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      reasoning: { effort: reasoningEffort },
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: buildInstructionOverlayPlanInstructions(options),
-            },
-          ],
-        },
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          name: "instruction_overlay_plan",
-          strict: true,
-          schema: INSTRUCTION_OVERLAY_PLAN_SCHEMA,
-        },
+  const response = await fetchOpenAi(
+    `${baseUrl}/responses`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
       },
-      max_output_tokens: maxOutputTokens.overlayPlan,
-      store: false,
-    }),
-  });
+      body: JSON.stringify({
+        model,
+        reasoning: { effort: reasoningEffort },
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: buildInstructionOverlayPlanInstructions(options),
+              },
+            ],
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "instruction_overlay_plan",
+            strict: true,
+            schema: INSTRUCTION_OVERLAY_PLAN_SCHEMA,
+          },
+        },
+        max_output_tokens: maxOutputTokens.overlayPlan,
+        store: false,
+      }),
+    },
+    {
+      code: "openai_instruction_overlay_plan_failed",
+      failureMessage:
+        "OpenAI instruction overlay planning request failed after retries",
+    }
+  );
   const body = (await readJsonResponse(response)) as OpenAiResponsesResponse;
   const requestId = getProviderRequestId(response);
 
@@ -3344,38 +3398,46 @@ async function generateInstructionDocument(options: {
 }) {
   const { apiKey, baseUrl, model, reasoningEffort, maxOutputTokens } =
     getOpenAiConfig();
-  const response = await fetch(`${baseUrl}/responses`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      reasoning: { effort: reasoningEffort },
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: buildInstructionDocumentInstructions(options),
-            },
-          ],
-        },
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          name: "instruction_document",
-          strict: true,
-          schema: INSTRUCTION_DOCUMENT_SCHEMA,
-        },
+  const response = await fetchOpenAi(
+    `${baseUrl}/responses`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
       },
-      max_output_tokens: maxOutputTokens.instructionDocument,
-      store: false,
-    }),
-  });
+      body: JSON.stringify({
+        model,
+        reasoning: { effort: reasoningEffort },
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: buildInstructionDocumentInstructions(options),
+              },
+            ],
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "instruction_document",
+            strict: true,
+            schema: INSTRUCTION_DOCUMENT_SCHEMA,
+          },
+        },
+        max_output_tokens: maxOutputTokens.instructionDocument,
+        store: false,
+      }),
+    },
+    {
+      code: "openai_instruction_document_failed",
+      failureMessage:
+        "OpenAI instruction document generation request failed after retries",
+    }
+  );
 
   const body = (await readJsonResponse(response)) as OpenAiResponsesResponse;
   const requestId = getProviderRequestId(response);
@@ -3740,46 +3802,54 @@ async function generateVoiceoverScript(options: {
   const { apiKey, baseUrl, model, reasoningEffort, maxOutputTokens } =
     getOpenAiConfig();
   const selectedDurationSeconds = getSelectedDurationSeconds(options.editPlan);
-  const response = await fetch(`${baseUrl}/responses`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      reasoning: { effort: reasoningEffort },
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: buildVoiceoverScriptInstructions({
-                prompt: options.prompt,
-                targetLanguage: options.targetLanguage,
-                selectedDurationSeconds,
-                transcript: options.transcript,
-                visualTimeline: options.visualTimeline,
-                editPlan: options.editPlan,
-                brandLanguageContext: options.brandLanguageContext,
-              }),
-            },
-          ],
-        },
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          name: "voiceover_script",
-          strict: true,
-          schema: VOICEOVER_SCRIPT_SCHEMA,
-        },
+  const response = await fetchOpenAi(
+    `${baseUrl}/responses`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
       },
-      max_output_tokens: maxOutputTokens.voiceoverScript,
-      store: false,
-    }),
-  });
+      body: JSON.stringify({
+        model,
+        reasoning: { effort: reasoningEffort },
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: buildVoiceoverScriptInstructions({
+                  prompt: options.prompt,
+                  targetLanguage: options.targetLanguage,
+                  selectedDurationSeconds,
+                  transcript: options.transcript,
+                  visualTimeline: options.visualTimeline,
+                  editPlan: options.editPlan,
+                  brandLanguageContext: options.brandLanguageContext,
+                }),
+              },
+            ],
+          },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "voiceover_script",
+            strict: true,
+            schema: VOICEOVER_SCRIPT_SCHEMA,
+          },
+        },
+        max_output_tokens: maxOutputTokens.voiceoverScript,
+        store: false,
+      }),
+    },
+    {
+      code: "openai_voiceover_script_failed",
+      failureMessage:
+        "OpenAI voiceover script generation request failed after retries",
+    }
+  );
 
   const body = (await readJsonResponse(response)) as OpenAiResponsesResponse;
   const requestId = getProviderRequestId(response);
@@ -3898,14 +3968,21 @@ async function generateOpenAiVoiceover(options: {
     requestBody.instructions = instructions;
   }
 
-  const response = await fetch(`${baseUrl}/audio/speech`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
+  const response = await fetchOpenAi(
+    `${baseUrl}/audio/speech`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
     },
-    body: JSON.stringify(requestBody),
-  });
+    {
+      code: "openai_tts_failed",
+      failureMessage: "OpenAI voiceover generation request failed after retries",
+    }
+  );
   const requestId = getProviderRequestId(response);
 
   if (!response.ok) {

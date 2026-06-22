@@ -33,6 +33,7 @@ type BatchVideoRow = {
   progress: number | null;
   current_stage: string | null;
   error_message: string | null;
+  retryable: boolean | null;
   final_r2_key: string | null;
   instruction_pdf_r2_key: string | null;
   created_at: string;
@@ -71,7 +72,7 @@ export async function GET(_request: Request, context: BatchContext) {
   const { data: videosData, error: videosError } = await supabaseAdmin
     .from("videos")
     .select(
-      "id,batch_position,original_filename,original_content_type,original_size_bytes,prompt,status,progress,current_stage,error_message,final_r2_key,instruction_pdf_r2_key,created_at,updated_at"
+      "id,batch_position,original_filename,original_content_type,original_size_bytes,prompt,status,progress,current_stage,error_message,retryable,final_r2_key,instruction_pdf_r2_key,created_at,updated_at"
     )
     .eq("batch_id", batchId)
     .order("batch_position", { ascending: true })
@@ -101,6 +102,7 @@ export async function GET(_request: Request, context: BatchContext) {
       progress: video.progress ?? 0,
       currentStage: video.current_stage,
       errorMessage: video.error_message,
+      retryable: video.retryable === true,
       downloadReady: video.status === "completed" && Boolean(video.final_r2_key),
       instructionPdfReady: Boolean(video.instruction_pdf_r2_key),
       createdAt: video.created_at,

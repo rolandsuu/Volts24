@@ -10,6 +10,10 @@ type VideoProcessingRow = {
   original_r2_key: string | null;
 };
 
+type RetryVideoProcessingRow = VideoProcessingRow & {
+  retryable: boolean | null;
+};
+
 type BatchVideoRow = {
   id: string;
   batch_position: number | null;
@@ -42,6 +46,11 @@ export type QueueVideoProcessingDependencies = {
 
 export type QueueUploadSessionOptions = {
   prompt?: string;
+};
+
+export type RetryVideoProcessingDependencies = {
+  loadVideo(videoId: string): Promise<RetryVideoProcessingRow>;
+  queueVideo(videoId: string): Promise<QueueVideoProcessingResult>;
 };
 
 export type QueueUploadSessionVideoResult =
@@ -147,6 +156,24 @@ async function loadVideoForProcessing(videoId: string) {
   return data as VideoProcessingRow;
 }
 
+async function loadVideoForRetry(videoId: string) {
+  const { data, error } = await supabaseAdmin
+    .from("videos")
+    .select("id,status,original_r2_key,retryable")
+    .eq("id", videoId)
+    .single();
+
+  if (error) {
+    if (error.code === "PGRST116") {
+      throw queueError("Video not found", 404);
+    }
+
+    throw queueError(`Failed to load video record: ${error.message}`, 500);
+  }
+
+  return data as RetryVideoProcessingRow;
+}
+
 async function verifyUploadExists(r2Key: string) {
   try {
     await r2.send(
@@ -228,6 +255,17 @@ function defaultQueueUploadSessionDependencies(): QueueUploadSessionDependencies
     queueVideo(video) {
       return queueVideoProcessing(video.id, {
         allowedStatuses: ["created", "uploaded"],
+      });
+    },
+  };
+}
+
+function defaultRetryVideoProcessingDependencies(): RetryVideoProcessingDependencies {
+  return {
+    loadVideo: loadVideoForRetry,
+    queueVideo(videoId) {
+      return queueVideoProcessing(videoId, {
+        allowedStatuses: ["failed"],
       });
     },
   };
@@ -353,6 +391,31 @@ export async function queueVideoProcessing(
     status: "queued",
     triggerRunId: triggerRun.id,
   };
+}
+
+export async function retryVideoProcessing(
+  videoId: string,
+  dependencies: RetryVideoProcessingDependencies =
+    defaultRetryVideoProcessingDependencies()
+) {
+  const video = await dependencies.loadVideo(videoId);
+
+  if (video.status !== "failed") {
+    throw queueError(
+      `Video cannot retry processing from status ${video.status}`,
+      409
+    );
+  }
+
+  if (video.retryable !== true) {
+    throw queueError("Video failure is not retryable", 409);
+  }
+
+  if (!video.original_r2_key) {
+    throw queueError("Video cannot retry without an original R2 object", 409);
+  }
+
+  return dependencies.queueVideo(videoId);
 }
 
 async function queueUploadSessionVideo(

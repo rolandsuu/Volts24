@@ -8,6 +8,7 @@ const {
   VideoProcessingQueueError,
   queueUploadSession,
   queueVideoProcessing,
+  retryVideoProcessing,
 } = await import("./video-processing.ts");
 
 function batchVideo(id: string, batchPosition: number) {
@@ -191,4 +192,83 @@ test("missing R2 object marks the video upload_failed before returning 400", asy
     "Uploaded object was not found in R2"
   );
   assert.equal(typeof updates[0].values.updated_at, "string");
+});
+
+test("retryVideoProcessing queues retryable failed videos", async () => {
+  const queuedVideoIds: string[] = [];
+
+  const result = await retryVideoProcessing("video-retry", {
+    async loadVideo(videoId) {
+      assert.equal(videoId, "video-retry");
+
+      return {
+        id: videoId,
+        status: "failed",
+        original_r2_key: "uploads/video-retry/source.mp4",
+        retryable: true,
+      };
+    },
+    async queueVideo(videoId) {
+      queuedVideoIds.push(videoId);
+
+      return {
+        videoId,
+        status: "queued",
+        triggerRunId: "run-video-retry",
+      };
+    },
+  });
+
+  assert.deepEqual(queuedVideoIds, ["video-retry"]);
+  assert.deepEqual(result, {
+    videoId: "video-retry",
+    status: "queued",
+    triggerRunId: "run-video-retry",
+  });
+});
+
+test("retryVideoProcessing rejects non-retryable failures", async () => {
+  await assert.rejects(
+    () =>
+      retryVideoProcessing("video-not-retryable", {
+        async loadVideo(videoId) {
+          return {
+            id: videoId,
+            status: "failed",
+            original_r2_key: "uploads/video-not-retryable/source.mp4",
+            retryable: false,
+          };
+        },
+        async queueVideo() {
+          assert.fail("non-retryable videos should not queue");
+        },
+      }),
+    {
+      name: "VideoProcessingQueueError",
+      message: "Video failure is not retryable",
+    }
+  );
+});
+
+test("retryVideoProcessing rejects completed videos", async () => {
+  await assert.rejects(
+    () =>
+      retryVideoProcessing("video-completed", {
+        async loadVideo(videoId) {
+          return {
+            id: videoId,
+            status: "completed",
+            original_r2_key: "uploads/video-completed/source.mp4",
+            retryable: null,
+          };
+        },
+        async queueVideo() {
+          assert.fail("completed videos should not queue");
+        },
+      }),
+    {
+      name: "VideoProcessingQueueError",
+      message: "Video cannot retry processing from status completed",
+    }
+  );
 });

@@ -50,6 +50,7 @@ type BatchVideoStatus = {
   progress: number;
   currentStage: string | null;
   errorMessage: string | null;
+  retryable: boolean;
   downloadReady: boolean;
   instructionPdfReady: boolean;
   createdAt: string;
@@ -337,6 +338,19 @@ async function completeBatchUpload(batchId: string, prompt: string) {
     throw new Error(
       await readErrorMessage(response, "启动 AI 处理失败。")
     );
+  }
+}
+
+async function retryVideoProcessing(videoId: string) {
+  const response = await fetch(
+    `/api/videos/${encodeURIComponent(videoId)}/retry-processing`,
+    {
+      method: "POST",
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response, "重试处理失败。"));
   }
 }
 
@@ -798,8 +812,10 @@ type UploadProgressListProps = {
   statusMessage: string | null;
   downloadingVideoId: string | null;
   downloadingInstructionPdfId: string | null;
+  retryingVideoId: string | null;
   onDownloadVideo(videoId: string): void;
   onDownloadInstructionPdf(videoId: string): void;
+  onRetryProcessing(videoId: string): void;
 };
 
 function UploadProgressList({
@@ -808,8 +824,10 @@ function UploadProgressList({
   statusMessage,
   downloadingVideoId,
   downloadingInstructionPdfId,
+  retryingVideoId,
   onDownloadVideo,
   onDownloadInstructionPdf,
+  onRetryProcessing,
 }: UploadProgressListProps) {
   const rows =
     items.length > 0
@@ -903,7 +921,7 @@ function UploadProgressList({
                 ? display.title
                 : getPhaseLabel(item.phase);
               const statusDetail =
-                batchVideo?.errorMessage ?? display?.detail ?? item.message;
+                display?.detail ?? batchVideo?.errorMessage ?? item.message;
               const canDownloadVideo = Boolean(batchVideo?.downloadReady);
               const canDownloadInstructionPdf = Boolean(
                 batchVideo?.instructionPdfReady
@@ -911,13 +929,17 @@ function UploadProgressList({
               const isDownloadingVideo = batchVideo?.id === downloadingVideoId;
               const isDownloadingInstructionPdf =
                 batchVideo?.id === downloadingInstructionPdfId;
+              const canRetryProcessing = Boolean(
+                batchVideo?.status === "failed" && batchVideo.retryable
+              );
+              const isRetryingProcessing = batchVideo?.id === retryingVideoId;
 
               return (
                 <li
                   key={item.id}
                   className="grid gap-4 border-t border-[#dce1ea] px-4 py-4 first:border-t-0 md:grid-cols-[minmax(0,1fr)_220px_190px_170px] md:items-center md:gap-5"
                 >
-                    <div className="grid min-w-0 grid-cols-[70px_minmax(0,1fr)] items-center gap-4">
+                  <div className="grid min-w-0 grid-cols-[70px_minmax(0,1fr)] items-center gap-4">
                     <FileThumb />
                     <div className="min-w-0">
                       <p className="truncate text-sm font-bold text-[#11131a]">
@@ -985,11 +1007,24 @@ function UploadProgressList({
                       </button>
                     )}
 
-                    {!canDownloadVideo && !canDownloadInstructionPdf && (
-                      <span className="text-sm font-medium text-[#8a93a3]">
-                        等待结果
-                      </span>
+                    {canRetryProcessing && batchVideo && (
+                      <button
+                        type="button"
+                        onClick={() => onRetryProcessing(batchVideo.id)}
+                        disabled={isRetryingProcessing}
+                        className="h-9 rounded-md bg-[#ee2b2f] px-3 text-sm font-semibold text-white transition hover:bg-[#c81818] disabled:cursor-not-allowed disabled:bg-[#aeb7c5]"
+                      >
+                        {isRetryingProcessing ? "启动中..." : "重试处理"}
+                      </button>
                     )}
+
+                    {!canDownloadVideo &&
+                      !canDownloadInstructionPdf &&
+                      !canRetryProcessing && (
+                        <span className="text-sm font-medium text-[#8a93a3]">
+                          等待结果
+                        </span>
+                      )}
                   </div>
                 </li>
               );
@@ -1014,6 +1049,7 @@ export function UploadWorkspace() {
   const [batchStatusMessage, setBatchStatusMessage] = useState<string | null>(
     null
   );
+  const [batchPollVersion, setBatchPollVersion] = useState(0);
   const [videoHistory, setVideoHistory] = useState<VideoJobHistoryItem[]>([]);
   const [historyMessage, setHistoryMessage] = useState<string | null>(null);
   const [historyRefreshCount, setHistoryRefreshCount] = useState(0);
@@ -1024,6 +1060,7 @@ export function UploadWorkspace() {
   );
   const [downloadingInstructionPdfId, setDownloadingInstructionPdfId] =
     useState<string | null>(null);
+  const [retryingVideoId, setRetryingVideoId] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const pendingResultScrollRef = useRef(false);
@@ -1126,7 +1163,7 @@ export function UploadWorkspace() {
         window.clearInterval(intervalId);
       }
     };
-  }, [activeBatchId]);
+  }, [activeBatchId, batchPollVersion]);
 
   useEffect(() => {
     if (!batchStatus || !pendingResultScrollRef.current) {
@@ -1356,6 +1393,27 @@ export function UploadWorkspace() {
       setBatchStatusMessage("操作 PDF 下载失败，请稍后重试。");
     } finally {
       setDownloadingInstructionPdfId(null);
+    }
+  }
+
+  async function retryProcessing(videoId: string) {
+    if (retryingVideoId) {
+      return;
+    }
+
+    setRetryingVideoId(videoId);
+    setBatchStatusMessage("正在重新启动 AI 处理...");
+
+    try {
+      await retryVideoProcessing(videoId);
+      setBatchStatusMessage("AI 处理已重新启动。");
+      setIsSubmitting(true);
+      setBatchPollVersion((value) => value + 1);
+      setHistoryRefreshCount((value) => value + 1);
+    } catch (error) {
+      setBatchStatusMessage(getErrorMessage(error, "重试处理失败，请稍后再试。"));
+    } finally {
+      setRetryingVideoId(null);
     }
   }
 
@@ -1595,8 +1653,10 @@ export function UploadWorkspace() {
         statusMessage={batchStatusMessage}
         downloadingVideoId={downloadingVideoId}
         downloadingInstructionPdfId={downloadingInstructionPdfId}
+        retryingVideoId={retryingVideoId}
         onDownloadVideo={downloadVideo}
         onDownloadInstructionPdf={downloadInstructionPdf}
+        onRetryProcessing={retryProcessing}
       />
 
       <RecentJobs
