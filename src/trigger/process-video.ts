@@ -5594,7 +5594,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
 
 export const processVideoTask = task({
   id: "process-video",
-  machine: "medium-1x",
+  machine: "large-2x",
   maxDuration: 60 * 30,
   run: async (payload: ProcessVideoPayload) => {
     await runProcessVideo(payload);
