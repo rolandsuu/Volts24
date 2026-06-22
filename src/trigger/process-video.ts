@@ -1495,34 +1495,94 @@ function extractOpenAiOutputText(body: OpenAiResponsesResponse) {
     return body.output_text;
   }
 
-  if (!Array.isArray(body.output)) {
-    return null;
-  }
-
   const textParts: string[] = [];
 
+  const collect = (value: unknown) => {
+    if (!value) {
+      return;
+    }
+
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+
+      if (trimmed) {
+        textParts.push(trimmed);
+      }
+
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        collect(item);
+      }
+
+      return;
+    }
+
+    if (typeof value !== "object") {
+      return;
+    }
+
+    const record = value as Record<string, unknown>;
+    const text = record.text;
+    const outputText = record.output_text;
+    const json = record.json;
+    const refusal = record.refusal;
+    const content = record.content;
+    const output = record.output;
+
+    if (typeof text === "string") {
+      const trimmed = text.trim();
+
+      if (trimmed) {
+        textParts.push(trimmed);
+      }
+    }
+
+    if (typeof outputText === "string") {
+      const trimmed = outputText.trim();
+
+      if (trimmed) {
+        textParts.push(trimmed);
+      }
+    }
+
+    if (typeof json === "string") {
+      const trimmed = json.trim();
+
+      if (trimmed) {
+        textParts.push(trimmed);
+      }
+    } else if (json && typeof json === "object") {
+      textParts.push(JSON.stringify(json));
+    }
+
+    if (typeof refusal === "string") {
+      const trimmed = refusal.trim();
+
+      if (trimmed) {
+        textParts.push(trimmed);
+      }
+    }
+
+    if (content !== undefined) {
+      collect(content);
+    }
+
+    if (output !== undefined) {
+      collect(output);
+    }
+  };
+
+  if (!Array.isArray(body.output)) {
+    collect(body);
+
+    return textParts.length > 0 ? textParts.join("\n") : null;
+  }
+
   for (const outputItem of body.output) {
-    if (!outputItem || typeof outputItem !== "object") {
-      continue;
-    }
-
-    const content = (outputItem as { content?: unknown }).content;
-
-    if (!Array.isArray(content)) {
-      continue;
-    }
-
-    for (const contentItem of content) {
-      if (!contentItem || typeof contentItem !== "object") {
-        continue;
-      }
-
-      const text = (contentItem as { text?: unknown }).text;
-
-      if (typeof text === "string") {
-        textParts.push(text);
-      }
-    }
+    collect(outputItem);
   }
 
   return textParts.length > 0 ? textParts.join("") : null;
@@ -3728,6 +3788,18 @@ async function generateVoiceoverScript(options: {
   const outputText = body ? extractOpenAiOutputText(body) : null;
   const providerRequestId =
     typeof body?.id === "string" ? body.id : requestId ?? null;
+
+  if (body && body.status === "incomplete") {
+    throw new WorkerError(
+      "OpenAI voiceover script generation response was incomplete before valid JSON was returned",
+      {
+        code: "openai_voiceover_script_incomplete",
+        provider: OPENAI_PROVIDER,
+        providerRequestId,
+        retryable: true,
+      }
+    );
+  }
 
   if (!outputText) {
     throw new WorkerError(
