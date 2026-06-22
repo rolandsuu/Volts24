@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildAssInstructionOverlayFile,
   buildAssSubtitleFile,
   buildClipScalePadFilters,
   DEFAULT_SUBTITLE_FONT_FAMILY,
@@ -88,6 +89,27 @@ test("buildAssSubtitleFile allows a custom subtitle font family", () => {
 
   assert.match(subtitles, /Style: Default,Custom CJK Font,58,/);
   assert.match(subtitles, /安装型材架到平台。/);
+});
+
+test("buildAssInstructionOverlayFile creates a boxed two-line overlay style", () => {
+  const overlays = buildAssInstructionOverlayFile(
+    [
+      {
+        startSeconds: 1,
+        endSeconds: 5,
+        text: "Next, unscrew the black knob and slide the electric eye to its highest position.",
+      },
+    ],
+    { width: 1920, height: 1080 }
+  );
+
+  assert.match(overlays, /Style: Instruction,/);
+  assert.match(overlays, /,3,\d+,\d+,2,/);
+  assert.match(
+    overlays,
+    /Dialogue: 0,0:00:01\.00,0:00:05\.00,Instruction,,0,0,0,,\{\\fad\(200,200\)\}/
+  );
+  assert.match(overlays, /\\N/);
 });
 
 test("normalizeRenderDimensions rounds odd dimensions up for yuv420p", () => {

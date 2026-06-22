@@ -1,5 +1,6 @@
 import { task } from "@trigger.dev/sdk/v3";
 import { GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import {
   FileState,
   GoogleGenAI,
@@ -12,6 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
+import { pathToFileURL } from "node:url";
 
 import {
   INSTRUCTION_DOCUMENT_SCHEMA,
@@ -21,6 +23,15 @@ import {
   type InstructionDocumentArtifact,
   type InstructionDocumentArtifactStep,
 } from "../lib/instruction-document";
+import {
+  buildInstructionOverlayRenderPlan,
+  getSelectedSegmentReferences,
+  INSTRUCTION_OVERLAY_PLAN_SCHEMA,
+  InstructionOverlayPlanValidationError,
+  validateInstructionOverlayPlan,
+  type InstructionOverlayPlan,
+  type InstructionOverlayRenderPlan,
+} from "../lib/instruction-overlay-plan";
 import { DEFAULT_TARGET_LANGUAGE } from "../lib/languages";
 import { r2, R2_BUCKET_NAME } from "../lib/r2";
 import {
@@ -37,9 +48,11 @@ import {
 } from "../lib/video-event-analysis";
 import { buildVoiceoverAlignmentFromTranscript } from "../lib/voiceover-alignment";
 import {
+  buildAssInstructionOverlayFile,
   buildAssSubtitleFile,
   buildClipScalePadFilters,
   readRenderDimensionsFromFfprobe,
+  type InstructionOverlayCue,
   type RenderDimensions,
   type SubtitleCue,
 } from "../lib/video-rendering";
@@ -137,6 +150,10 @@ type OpenAiResponsesResponse = {
   usage?: unknown;
 };
 
+type VideoAnalysisProvider = "twelvelabs" | "gemini" | "openai";
+type VideoStyle = "instruction_overlay" | "voiceover_subtitles";
+type FinalRenderer = "remotion" | "ffmpeg";
+
 const STAGE_PROGRESS: Record<WorkerStage, number> = {
   queued: 5,
   downloading_source: 8,
@@ -172,6 +189,12 @@ const OPENAI_DEFAULT_MODEL = "gpt-5-mini";
 const OPENAI_TTS_DEFAULT_MODEL = "gpt-4o-mini-tts";
 const OPENAI_TTS_DEFAULT_VOICE = "cedar";
 const OPENAI_TTS_OUTPUT_FORMAT = "mp3";
+const TWELVELABS_PROVIDER = "twelvelabs";
+const TWELVELABS_DEFAULT_BASE_URL = "https://api.twelvelabs.io/v1.3";
+const TWELVELABS_DEFAULT_MODEL = "pegasus1.5";
+const TWELVELABS_ANALYSIS_TIMEOUT_MS = 25 * 60 * 1000;
+const TWELVELABS_POLL_INTERVAL_MS = 5000;
+const TWELVELABS_SIGNED_URL_EXPIRES_SECONDS = 2 * 60 * 60;
 const GEMINI_PROVIDER = "gemini";
 const GEMINI_DEFAULT_MODEL = "gemini-3.5-flash";
 const GEMINI_FILE_PROCESSING_TIMEOUT_MS = 10 * 60 * 1000;
@@ -180,6 +203,7 @@ const DEFAULT_FRAME_SAMPLE_INTERVAL_SECONDS = 3;
 const DEFAULT_MAX_VISUAL_FRAMES = 30;
 const OPENAI_VISUAL_ANALYSIS_MAX_OUTPUT_TOKENS = 12000;
 const OPENAI_EDIT_PLAN_MAX_OUTPUT_TOKENS = 12000;
+const OPENAI_OVERLAY_PLAN_MAX_OUTPUT_TOKENS = 6000;
 const GEMINI_VIDEO_EVENT_ANALYSIS_MAX_OUTPUT_TOKENS = 8000;
 const MAX_TRANSCRIPT_CONTEXT_CHARS = 6000;
 const MAX_EDIT_PLAN_UTTERANCES = 80;
@@ -187,6 +211,11 @@ const MAX_EDIT_PLAN_WORDS = 300;
 const MIN_EDIT_SEGMENT_DURATION_SECONDS = 0.25;
 const FINAL_RENDER_CRF = "23";
 const FINAL_RENDER_PRESET = "veryfast";
+const DEFAULT_VIDEO_STYLE: VideoStyle = "instruction_overlay";
+const DEFAULT_RENDERER: FinalRenderer = "ffmpeg";
+const DEFAULT_OUTPUT_VIDEO_BITRATE = "8M";
+const REMOTION_COMPOSITION_ID = "InstructionVideo";
+const REMOTION_FPS = 30;
 const MAX_INSTRUCTION_DOCUMENT_STEPS = 12;
 const INSTRUCTION_FRAME_WIDTH = 1280;
 const PDF_PAGE_WIDTH = 595.28;
@@ -620,6 +649,17 @@ async function uploadJsonToR2(key: string, value: unknown) {
   );
 }
 
+async function createSignedR2ReadUrl(key: string, expiresInSeconds: number) {
+  return getSignedUrl(
+    r2,
+    new GetObjectCommand({
+      Bucket: R2_BUCKET_NAME,
+      Key: key,
+    }),
+    { expiresIn: expiresInSeconds }
+  );
+}
+
 function runFfmpeg(args: string[], options?: { cwd?: string }) {
   return new Promise<void>((resolve, reject) => {
     const child = spawn("ffmpeg", args, {
@@ -745,6 +785,52 @@ function getBooleanEnv(name: string, fallback: boolean) {
   });
 }
 
+function getEnumEnv<T extends string>(
+  name: string,
+  allowedValues: readonly T[],
+  fallback: T
+): T {
+  const rawValue = process.env[name];
+
+  if (!rawValue) {
+    return fallback;
+  }
+
+  const normalized = rawValue.trim().toLowerCase();
+
+  if (allowedValues.includes(normalized as T)) {
+    return normalized as T;
+  }
+
+  throw new WorkerError(
+    `${name} must be one of: ${allowedValues.join(", ")}`,
+    {
+      code: "worker_config_invalid",
+      retryable: false,
+    }
+  );
+}
+
+function getVideoStyle() {
+  return getEnumEnv<VideoStyle>(
+    "VIDEO_STYLE",
+    ["instruction_overlay", "voiceover_subtitles"],
+    DEFAULT_VIDEO_STYLE
+  );
+}
+
+function getRenderer() {
+  return getEnumEnv<FinalRenderer>(
+    "RENDERER",
+    ["remotion", "ffmpeg"],
+    DEFAULT_RENDERER
+  );
+}
+
+function getOutputVideoBitrate() {
+  return getOptionalStringEnv("OUTPUT_VIDEO_BITRATE") ?? DEFAULT_OUTPUT_VIDEO_BITRATE;
+}
+
 function getAssemblyAiConfig() {
   const apiKey = process.env.ASSEMBLYAI_API_KEY;
 
@@ -787,16 +873,40 @@ function getOpenAiConfig() {
   };
 }
 
-function getGeminiConfig() {
+function getTwelveLabsConfig() {
+  const apiKey = process.env.TWELVELABS_API_KEY;
+
+  if (!apiKey) {
+    throw new WorkerError(
+      "Missing TwelveLabs API key. Set TWELVELABS_API_KEY.",
+      {
+        code: "twelvelabs_api_key_missing",
+        provider: TWELVELABS_PROVIDER,
+        retryable: false,
+      }
+    );
+  }
+
+  return {
+    apiKey,
+    baseUrl: normalizeBaseUrl(
+      process.env.TWELVELABS_BASE_URL ?? TWELVELABS_DEFAULT_BASE_URL
+    ),
+    model: process.env.TWELVELABS_ANALYZE_MODEL ?? TWELVELABS_DEFAULT_MODEL,
+  };
+}
+
+function getGeminiConfig(options?: {
+  enabledOverride?: boolean;
+  requiredOverride?: boolean;
+}) {
   const apiKey = process.env.GEMINI_API_KEY;
-  const enabled = getBooleanEnv(
-    "GEMINI_VIDEO_EVENT_ANALYSIS_ENABLED",
-    false
-  );
-  const required = getBooleanEnv(
-    "GEMINI_VIDEO_EVENT_ANALYSIS_REQUIRED",
-    false
-  );
+  const enabled =
+    options?.enabledOverride ??
+    getBooleanEnv("GEMINI_VIDEO_EVENT_ANALYSIS_ENABLED", false);
+  const required =
+    options?.requiredOverride ??
+    getBooleanEnv("GEMINI_VIDEO_EVENT_ANALYSIS_REQUIRED", false);
 
   if (required && !enabled) {
     throw new WorkerError(
@@ -822,6 +932,57 @@ function getGeminiConfig() {
     required,
     apiKey: apiKey ?? null,
     model: process.env.GEMINI_VIDEO_MODEL ?? GEMINI_DEFAULT_MODEL,
+  };
+}
+
+function getVideoAnalysisConfig() {
+  const rawProvider = process.env.VIDEO_ANALYSIS_PROVIDER;
+
+  if (rawProvider) {
+    const provider = getEnumEnv<VideoAnalysisProvider>(
+      "VIDEO_ANALYSIS_PROVIDER",
+      ["twelvelabs", "gemini", "openai"],
+      "openai"
+    );
+
+    if (provider === "twelvelabs") {
+      const twelveLabs = getTwelveLabsConfig();
+
+      return {
+        provider,
+        required: true,
+        twelveLabs,
+        gemini: getGeminiConfig(),
+      };
+    }
+
+    if (provider === "gemini") {
+      return {
+        provider,
+        required: true,
+        twelveLabs: null,
+        gemini: getGeminiConfig({
+          enabledOverride: true,
+          requiredOverride: true,
+        }),
+      };
+    }
+
+    return {
+      provider,
+      required: false,
+      twelveLabs: null,
+      gemini: getGeminiConfig(),
+    };
+  }
+
+  const gemini = getGeminiConfig();
+
+  return {
+    provider: gemini.enabled ? ("gemini" as const) : ("openai" as const),
+    required: gemini.required,
+    twelveLabs: null,
+    gemini,
   };
 }
 
@@ -1344,9 +1505,11 @@ function parseJsonObject(text: string) {
 
 function buildProviderRunIds(ids: {
   assemblyAiTranscriptId?: string | null;
+  twelveLabsAnalysisTaskId?: string | null;
   geminiVideoEventResponseId?: string | null;
   openAiVisualResponseId?: string | null;
   openAiEditPlanResponseId?: string | null;
+  openAiOverlayPlanResponseId?: string | null;
   openAiInstructionDocumentResponseId?: string | null;
   openAiScriptResponseId?: string | null;
   openAiTtsRequestId?: string | null;
@@ -1356,6 +1519,10 @@ function buildProviderRunIds(ids: {
 
   if (ids.assemblyAiTranscriptId) {
     providerRunIds.assemblyai_transcript_id = ids.assemblyAiTranscriptId;
+  }
+
+  if (ids.twelveLabsAnalysisTaskId) {
+    providerRunIds.twelvelabs_analysis_task_id = ids.twelveLabsAnalysisTaskId;
   }
 
   if (ids.geminiVideoEventResponseId) {
@@ -1370,6 +1537,11 @@ function buildProviderRunIds(ids: {
   if (ids.openAiEditPlanResponseId) {
     providerRunIds.openai_edit_plan_response_id =
       ids.openAiEditPlanResponseId;
+  }
+
+  if (ids.openAiOverlayPlanResponseId) {
+    providerRunIds.openai_overlay_plan_response_id =
+      ids.openAiOverlayPlanResponseId;
   }
 
   if (ids.openAiInstructionDocumentResponseId) {
@@ -1412,6 +1584,488 @@ function compactTranscriptContext(transcript: AssemblyAiTranscriptResponse) {
         ? transcript.language_code
         : null,
     utteranceSamples: utterances,
+  };
+}
+
+function getTwelveLabsErrorMessage(body: unknown, fallback: string) {
+  if (body && typeof body === "object" && "error" in body) {
+    const error = (body as { error?: unknown }).error;
+
+    if (typeof error === "string" && error.trim()) {
+      return error;
+    }
+
+    if (error && typeof error === "object" && "message" in error) {
+      const message = (error as { message?: unknown }).message;
+
+      if (typeof message === "string" && message.trim()) {
+        return message;
+      }
+    }
+  }
+
+  if (body && typeof body === "object" && "message" in body) {
+    const message = (body as { message?: unknown }).message;
+
+    if (typeof message === "string" && message.trim()) {
+      return message;
+    }
+  }
+
+  if (typeof body === "string" && body.trim()) {
+    return body;
+  }
+
+  return fallback;
+}
+
+function readTwelveLabsTaskId(body: unknown) {
+  if (!isRecord(body)) {
+    return null;
+  }
+
+  for (const key of ["task_id", "id", "_id", "taskId"]) {
+    const value = body[key];
+
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  return null;
+}
+
+function buildTwelveLabsSegmentDefinition(options: {
+  prompt: string;
+  targetLanguage: string;
+}) {
+  return {
+    id: "instruction_steps",
+    description: [
+      "Detect instructional machine-operation segments where the viewer needs to understand a visible action, physical adjustment, safety-relevant state, or final position.",
+      `Editing intent: ${options.prompt}`,
+      `Caption target language later in the pipeline: ${options.targetLanguage}`,
+      "Prefer practical action boundaries that can become readable tutorial steps. Avoid long dead air, repeated explanation, unrelated setup, and purely conversational moments.",
+    ].join(" "),
+    fields: [
+      {
+        name: "title",
+        type: "string",
+        description: "A short editor-facing title for this action segment.",
+      },
+      {
+        name: "description",
+        type: "string",
+        description:
+          "What the viewer sees and why this action matters in the procedure.",
+      },
+      {
+        name: "visible_action",
+        type: "string",
+        description:
+          "The concrete hand, tool, screw, sensor, knob, UI, or machine movement visible in this segment.",
+      },
+      {
+        name: "spoken_evidence",
+        type: "string",
+        description:
+          "Any relevant speech or audio cue, or 'No speech evidence' if the segment is visual-only.",
+      },
+      {
+        name: "importance",
+        type: "string",
+        enum: ["primary", "supporting", "context"],
+        description:
+          "primary for essential mechanical or safety actions, supporting for normal tutorial steps, context for setup or connector shots.",
+      },
+      {
+        name: "confidence",
+        type: "number",
+        description: "Confidence from 0 to 1 that this is an instructional step.",
+      },
+    ],
+  };
+}
+
+async function submitTwelveLabsAnalysisTask(options: {
+  videoId: string;
+  signedSourceUrl: string;
+  prompt: string;
+  targetLanguage: string;
+}) {
+  const { apiKey, baseUrl, model } = getTwelveLabsConfig();
+  const customId = `blooclip_${options.videoId}`
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .slice(0, 64);
+  const response = await fetch(`${baseUrl}/analyze/tasks`, {
+    method: "POST",
+    headers: {
+      "x-api-key": apiKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      video: {
+        type: "url",
+        url: options.signedSourceUrl,
+      },
+      custom_id: customId,
+      model_name: model,
+      analysis_mode: "time_based_metadata",
+      temperature: 0.2,
+      max_tokens: 32768,
+      min_segment_duration: 2,
+      max_segment_duration: 8,
+      response_format: {
+        type: "segment_definitions",
+        segment_definitions: [
+          buildTwelveLabsSegmentDefinition({
+            prompt: options.prompt,
+            targetLanguage: options.targetLanguage,
+          }),
+        ],
+      },
+    }),
+  });
+  const body = await readJsonResponse(response);
+  const taskId = readTwelveLabsTaskId(body);
+
+  if (!response.ok) {
+    throw new WorkerError(
+      getTwelveLabsErrorMessage(
+        body,
+        `TwelveLabs analysis task creation failed with HTTP ${response.status}`
+      ),
+      {
+        code: "twelvelabs_analysis_create_failed",
+        provider: TWELVELABS_PROVIDER,
+        providerRequestId: taskId ?? getProviderRequestId(response),
+        retryable: response.status === 429 || response.status >= 500,
+      }
+    );
+  }
+
+  if (!taskId) {
+    throw new WorkerError("TwelveLabs analysis task response was invalid", {
+      code: "twelvelabs_analysis_create_response_invalid",
+      provider: TWELVELABS_PROVIDER,
+      providerRequestId: getProviderRequestId(response),
+      retryable: true,
+    });
+  }
+
+  return {
+    taskId,
+    model,
+    rawResponse: body,
+  };
+}
+
+async function pollTwelveLabsAnalysisTask(taskId: string) {
+  const { apiKey, baseUrl } = getTwelveLabsConfig();
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < TWELVELABS_ANALYSIS_TIMEOUT_MS) {
+    const response = await fetch(
+      `${baseUrl}/analyze/tasks/${encodeURIComponent(taskId)}`,
+      {
+        headers: {
+          "x-api-key": apiKey,
+        },
+      }
+    );
+    const body = await readJsonResponse(response);
+
+    if (!response.ok) {
+      throw new WorkerError(
+        getTwelveLabsErrorMessage(
+          body,
+          `TwelveLabs analysis poll failed with HTTP ${response.status}`
+        ),
+        {
+          code: "twelvelabs_analysis_poll_failed",
+          provider: TWELVELABS_PROVIDER,
+          providerRequestId: taskId,
+          retryable: response.status === 429 || response.status >= 500,
+        }
+      );
+    }
+
+    const status = isRecord(body) && typeof body.status === "string"
+      ? body.status
+      : null;
+
+    if (status === "ready") {
+      return body;
+    }
+
+    if (status === "failed") {
+      throw new WorkerError(
+        getTwelveLabsErrorMessage(body, "TwelveLabs analysis task failed"),
+        {
+          code: "twelvelabs_analysis_failed",
+          provider: TWELVELABS_PROVIDER,
+          providerRequestId: taskId,
+          retryable: false,
+        }
+      );
+    }
+
+    await wait(TWELVELABS_POLL_INTERVAL_MS);
+  }
+
+  throw new WorkerError("TwelveLabs analysis task timed out", {
+    code: "twelvelabs_analysis_timeout",
+    provider: TWELVELABS_PROVIDER,
+    providerRequestId: taskId,
+    retryable: true,
+  });
+}
+
+function parseTwelveLabsResultData(taskResponse: unknown) {
+  if (!isRecord(taskResponse) || !isRecord(taskResponse.result)) {
+    throw new WorkerError("TwelveLabs analysis result was missing", {
+      code: "twelvelabs_analysis_result_missing",
+      provider: TWELVELABS_PROVIDER,
+      retryable: true,
+    });
+  }
+
+  const data = taskResponse.result.data;
+
+  if (typeof data === "string") {
+    try {
+      return JSON.parse(data) as unknown;
+    } catch {
+      throw new WorkerError("TwelveLabs analysis result JSON was invalid", {
+        code: "twelvelabs_analysis_result_json_invalid",
+        provider: TWELVELABS_PROVIDER,
+        retryable: true,
+      });
+    }
+  }
+
+  if (isRecord(data)) {
+    return data;
+  }
+
+  throw new WorkerError("TwelveLabs analysis result data was invalid", {
+    code: "twelvelabs_analysis_result_invalid",
+    provider: TWELVELABS_PROVIDER,
+    retryable: true,
+  });
+}
+
+function readMetadataString(
+  metadata: Record<string, unknown>,
+  key: string,
+  fallback: string
+) {
+  const value = metadata[key];
+
+  return typeof value === "string" && value.trim() ? value.trim() : fallback;
+}
+
+function readMetadataConfidence(metadata: Record<string, unknown>) {
+  const confidence = metadata.confidence;
+
+  if (
+    typeof confidence === "number" &&
+    Number.isFinite(confidence) &&
+    confidence >= 0 &&
+    confidence <= 1
+  ) {
+    return confidence;
+  }
+
+  return 0.75;
+}
+
+function readTwelveLabsInstructionSegments(resultData: unknown) {
+  if (!isRecord(resultData)) {
+    return [];
+  }
+
+  const segments = resultData.instruction_steps;
+
+  if (Array.isArray(segments)) {
+    return segments;
+  }
+
+  const firstArray = Object.values(resultData).find(Array.isArray);
+
+  return Array.isArray(firstArray) ? firstArray : [];
+}
+
+function normalizeTwelveLabsImportance(value: unknown) {
+  return value === "primary" || value === "supporting" || value === "context"
+    ? value
+    : "supporting";
+}
+
+function buildVideoEventAnalysisFromTwelveLabs(options: {
+  resultData: unknown;
+  prompt: string;
+  sourceDurationSeconds: number;
+}) {
+  const rawSegments = readTwelveLabsInstructionSegments(options.resultData);
+  const events = rawSegments
+    .flatMap((segment): Record<string, unknown>[] =>
+      isRecord(segment) ? [segment] : []
+    )
+    .map((segment) => {
+      const startSeconds = Number(segment.start_time ?? segment.startSeconds);
+      const endSeconds = Number(segment.end_time ?? segment.endSeconds);
+      const metadata = isRecord(segment.metadata) ? segment.metadata : {};
+
+      return {
+        startSeconds: Math.max(0, roundSeconds(startSeconds)),
+        endSeconds: Math.min(
+          options.sourceDurationSeconds,
+          roundSeconds(endSeconds)
+        ),
+        metadata,
+      };
+    })
+    .filter(
+      (segment) =>
+        Number.isFinite(segment.startSeconds) &&
+        Number.isFinite(segment.endSeconds) &&
+        segment.endSeconds > segment.startSeconds
+    )
+    .sort((a, b) => a.startSeconds - b.startSeconds)
+    .map((segment, index) => {
+      const eventIndex = index + 1;
+      const metadata = segment.metadata;
+      const description = readMetadataString(
+        metadata,
+        "description",
+        "Instructional action detected by TwelveLabs."
+      );
+      const visualEvidence = readMetadataString(
+        metadata,
+        "visible_action",
+        description
+      );
+
+      return {
+        eventIndex,
+        title: readMetadataString(
+          metadata,
+          "title",
+          `Instruction step ${eventIndex}`
+        ),
+        description,
+        startSeconds: segment.startSeconds,
+        endSeconds: segment.endSeconds,
+        importance: normalizeTwelveLabsImportance(metadata.importance),
+        confidence: readMetadataConfidence(metadata),
+        visualEvidence,
+        transcriptEvidence: readMetadataString(
+          metadata,
+          "spoken_evidence",
+          "No speech evidence"
+        ),
+      };
+    });
+
+  if (events.length === 0) {
+    throw new WorkerError(
+      "TwelveLabs analysis did not return any instructional segments",
+      {
+        code: "twelvelabs_analysis_segments_empty",
+        provider: TWELVELABS_PROVIDER,
+        retryable: true,
+      }
+    );
+  }
+
+  const primaryEvent =
+    events.find((event) => event.importance === "primary") ?? events[0];
+  const recommendedSegments = events.map((event, index) => ({
+    segmentIndex: index + 1,
+    eventIndex: event.eventIndex,
+    sourceStart: event.startSeconds,
+    sourceEnd: event.endSeconds,
+    reason:
+      event.importance === "context"
+        ? "Useful setup context for the instruction sequence."
+        : "Timestamped instructional action detected by TwelveLabs.",
+    confidence: event.confidence,
+  }));
+  const omittedRanges = events.flatMap((event, index) => {
+    const nextEvent = events[index + 1];
+
+    if (!nextEvent || nextEvent.startSeconds - event.endSeconds < 1) {
+      return [];
+    }
+
+    return [
+      {
+        sourceStart: event.endSeconds,
+        sourceEnd: nextEvent.startSeconds,
+        reason: "No instructional action detected between selected steps.",
+      },
+    ];
+  });
+
+  return validateVideoEventAnalysis(
+    {
+      summary: `TwelveLabs found ${events.length} timestamped instructional segments for: ${options.prompt}`,
+      events,
+      primaryEventIndex: primaryEvent.eventIndex,
+      recommendedSegments,
+      omittedRanges,
+      warnings: [],
+    },
+    {
+      sourceDurationSeconds: options.sourceDurationSeconds,
+    }
+  );
+}
+
+async function analyzeVideoEventsWithTwelveLabs(options: {
+  videoId: string;
+  sourceR2Key: string;
+  transcriptR2Key: string;
+  prompt: string;
+  targetLanguage: string;
+  durationSeconds: number;
+}) {
+  const signedSourceUrl = await createSignedR2ReadUrl(
+    options.sourceR2Key,
+    TWELVELABS_SIGNED_URL_EXPIRES_SECONDS
+  );
+  const task = await submitTwelveLabsAnalysisTask({
+    videoId: options.videoId,
+    signedSourceUrl,
+    prompt: options.prompt,
+    targetLanguage: options.targetLanguage,
+  });
+  const taskResponse = await pollTwelveLabsAnalysisTask(task.taskId);
+  const resultData = parseTwelveLabsResultData(taskResponse);
+  const validatedAnalysis = buildVideoEventAnalysisFromTwelveLabs({
+    resultData,
+    prompt: options.prompt,
+    sourceDurationSeconds: options.durationSeconds,
+  });
+
+  return {
+    videoId: options.videoId,
+    sourceR2Key: options.sourceR2Key,
+    transcriptR2Key: options.transcriptR2Key,
+    provider: TWELVELABS_PROVIDER,
+    providerRequestId: task.taskId,
+    model: task.model,
+    completedAt: new Date().toISOString(),
+    sourceDurationSeconds: options.durationSeconds,
+    prompt: options.prompt,
+    targetLanguage: options.targetLanguage,
+    ...validatedAnalysis,
+    rawResponse: {
+      createTask: task.rawResponse,
+      task: taskResponse,
+      data: resultData,
+    },
   };
 }
 
@@ -2255,6 +2909,235 @@ async function planTutorialSegments(options: {
 type EditPlanArtifact = Awaited<ReturnType<typeof planTutorialSegments>> &
   Record<string, unknown>;
 
+function compactEditPlanForOverlayPlan(editPlan: EditPlanArtifact) {
+  return {
+    tutorialGoal: editPlan.tutorialGoal,
+    tutorialSteps: editPlan.tutorialSteps,
+    segments: editPlan.segments,
+    warnings: editPlan.warnings,
+  };
+}
+
+function buildInstructionOverlayPlanInstructions(options: {
+  prompt: string;
+  targetLanguage: string;
+  transcript: AssemblyAiTranscriptResponse;
+  visualTimeline: VisualTimelineArtifact;
+  videoEventAnalysis?: VideoEventAnalysisArtifact | null;
+  editPlan: EditPlanArtifact;
+}) {
+  return [
+    "Create a Vidocu-style instruction overlay render plan for an already selected tutorial edit.",
+    "Return JSON only, following the required schema.",
+    "Do not change sourceStart or sourceEnd. Use the selected edit-plan segments as fixed visual clips.",
+    "Create exactly one overlay segment for each selected edit-plan segment.",
+    "",
+    `User prompt: ${options.prompt}`,
+    `Target language: ${options.targetLanguage}`,
+    "",
+    "Caption rules:",
+    "- Each overlayCaption is a visual instruction, not a subtitle transcript.",
+    "- English captions should be 8-18 words and fit in at most 2 lines.",
+    "- Chinese captions should be short, practical, and fit in 1-2 lines.",
+    "- Describe the visible action at that moment. Prefer verbs like loosen, slide, align, tighten, check, press, lift, connect, remove, install, and confirm.",
+    "- Do not mention timing, camera, clip, frame, AI, transcript, or source evidence in the caption.",
+    "- Do not make captions decorative or marketing-like.",
+    "",
+    "Rhythm rules:",
+    "- Normal step clip: 3-6 seconds.",
+    "- Quick connector clip: 1-2.5 seconds.",
+    "- Important mechanical or safety action: 5-8 seconds.",
+    "- Add 0.3-0.6 seconds of holdAfterActionSeconds after key mechanical, alignment, or safety actions.",
+    "- Use 0-0.2 seconds hold for quick connectors.",
+    "- captionStart and captionEnd are seconds relative to the selected segment after trimming.",
+    "- Let captions cover the action and the short hold when useful.",
+    "",
+    "Visual rules:",
+    "- transitionToNext should usually be { type: 'hard_cut', durationFrames: 0 }.",
+    "- Only use { type: 'fade', durationFrames: 6-10 } if a cut would feel visually harsh.",
+    "- optionalCrop.type should be 'none' unless the shot is static and wide.",
+    "- If using optionalCrop subtle_zoom, keep scale at 1.02-1.08 and do not hide hands, screws, sensors, knobs, tools, or machine reference points.",
+    "",
+    "Transcript context:",
+    JSON.stringify(compactTranscriptForEditPlan(options.transcript), null, 2),
+    "",
+    options.videoEventAnalysis
+      ? "Whole-video event analysis:"
+      : "Whole-video event analysis: not available.",
+    options.videoEventAnalysis
+      ? JSON.stringify(
+          compactVideoEventAnalysisForEditPlan(options.videoEventAnalysis),
+          null,
+          2
+        )
+      : "",
+    "",
+    "Visual timeline context:",
+    JSON.stringify(
+      compactVisualTimelineForEditPlan(options.visualTimeline),
+      null,
+      2
+    ),
+    "",
+    "Fixed selected edit plan:",
+    JSON.stringify(compactEditPlanForOverlayPlan(options.editPlan), null, 2),
+  ].join("\n");
+}
+
+async function planInstructionOverlays(options: {
+  videoId: string;
+  sourceR2Key: string;
+  editPlanR2Key: string;
+  prompt: string;
+  targetLanguage: string;
+  transcript: AssemblyAiTranscriptResponse;
+  visualTimeline: VisualTimelineArtifact;
+  videoEventAnalysis?: VideoEventAnalysisArtifact | null;
+  editPlan: EditPlanArtifact;
+}) {
+  const selectedSegments = getSelectedSegmentReferences(options.editPlan);
+
+  if (selectedSegments.length === 0) {
+    throw new WorkerError(
+      "Edit plan did not contain selected segments for instruction overlays",
+      {
+        code: "instruction_overlay_segments_missing",
+        provider: OPENAI_PROVIDER,
+        retryable: true,
+      }
+    );
+  }
+
+  const { apiKey, baseUrl, model } = getOpenAiConfig();
+  const response = await fetch(`${baseUrl}/responses`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: buildInstructionOverlayPlanInstructions(options),
+            },
+          ],
+        },
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "instruction_overlay_plan",
+          strict: true,
+          schema: INSTRUCTION_OVERLAY_PLAN_SCHEMA,
+        },
+      },
+      max_output_tokens: OPENAI_OVERLAY_PLAN_MAX_OUTPUT_TOKENS,
+      store: false,
+    }),
+  });
+  const body = (await readJsonResponse(response)) as OpenAiResponsesResponse;
+  const requestId = getProviderRequestId(response);
+
+  if (!response.ok) {
+    throw new WorkerError(
+      getOpenAiErrorMessage(
+        body,
+        `OpenAI instruction overlay planning failed with HTTP ${response.status}`
+      ),
+      {
+        code: "openai_instruction_overlay_plan_failed",
+        provider: OPENAI_PROVIDER,
+        providerRequestId: requestId,
+        retryable: response.status === 429 || response.status >= 500,
+      }
+    );
+  }
+
+  const providerRequestId =
+    typeof body?.id === "string" ? body.id : requestId ?? null;
+
+  if (body.status === "incomplete") {
+    throw new WorkerError(
+      "OpenAI instruction overlay planning response was incomplete before valid JSON was returned",
+      {
+        code: "openai_instruction_overlay_plan_incomplete",
+        provider: OPENAI_PROVIDER,
+        providerRequestId,
+        retryable: true,
+      }
+    );
+  }
+
+  const outputText = body ? extractOpenAiOutputText(body) : null;
+
+  if (!outputText) {
+    throw new WorkerError(
+      "OpenAI instruction overlay planning response had no output text",
+      {
+        code: "openai_instruction_overlay_plan_output_missing",
+        provider: OPENAI_PROVIDER,
+        providerRequestId,
+        retryable: true,
+      }
+    );
+  }
+
+  let parsedOutput: Record<string, unknown>;
+
+  try {
+    parsedOutput = parseJsonObject(outputText);
+  } catch (error) {
+    throw new WorkerError(
+      error instanceof Error
+        ? error.message
+        : "OpenAI instruction overlay plan JSON was invalid",
+      {
+        code: "openai_instruction_overlay_plan_json_invalid",
+        provider: OPENAI_PROVIDER,
+        providerRequestId,
+        retryable: true,
+      }
+    );
+  }
+
+  let overlayPlan: InstructionOverlayPlan;
+
+  try {
+    overlayPlan = validateInstructionOverlayPlan(parsedOutput, {
+      selectedSegments,
+      targetLanguage: options.targetLanguage,
+    });
+  } catch (error) {
+    if (error instanceof InstructionOverlayPlanValidationError) {
+      throw new WorkerError(error.message, {
+        code: "openai_instruction_overlay_plan_validation_failed",
+        provider: OPENAI_PROVIDER,
+        providerRequestId,
+        retryable: true,
+      });
+    }
+
+    throw error;
+  }
+
+  return {
+    videoId: options.videoId,
+    sourceR2Key: options.sourceR2Key,
+    editPlanR2Key: options.editPlanR2Key,
+    provider: OPENAI_PROVIDER,
+    providerRequestId,
+    model,
+    completedAt: new Date().toISOString(),
+    instructionOverlayPlan: overlayPlan,
+    rawResponse: body,
+  };
+}
+
 type InstructionFrameAsset = {
   stepIndex: number;
   filePath: string;
@@ -2457,7 +3340,10 @@ type RenderSegment = {
   index: number;
   sourceStart: number;
   sourceEnd: number;
+  sourceDurationSeconds: number;
   durationSeconds: number;
+  holdAfterActionSeconds: number;
+  optionalCrop: InstructionOverlayRenderPlan["segments"][number]["optionalCrop"] | null;
 };
 
 async function resolveBrandLanguageContext(
@@ -2475,6 +3361,30 @@ async function resolveBrandLanguageContext(
 
 function getSelectedDurationSeconds(editPlan: EditPlanArtifact) {
   const segments = Array.isArray(editPlan.segments) ? editPlan.segments : [];
+  const overlayPlan = isRecord(editPlan.instructionOverlayPlan)
+    ? editPlan.instructionOverlayPlan
+    : null;
+  const overlaySegments = isRecord(overlayPlan) && Array.isArray(overlayPlan.segments)
+    ? overlayPlan.segments
+    : [];
+  const holdSecondsBySegmentIndex = new Map<number, number>();
+
+  for (const overlaySegment of overlaySegments) {
+    if (!isRecord(overlaySegment)) {
+      continue;
+    }
+
+    const segmentIndex = overlaySegment.segmentIndex;
+    const holdAfterActionSeconds = overlaySegment.holdAfterActionSeconds;
+
+    if (
+      typeof segmentIndex === "number" &&
+      typeof holdAfterActionSeconds === "number" &&
+      Number.isFinite(holdAfterActionSeconds)
+    ) {
+      holdSecondsBySegmentIndex.set(segmentIndex, holdAfterActionSeconds);
+    }
+  }
 
   return roundSeconds(
     segments.reduce((total, segment) => {
@@ -2484,12 +3394,22 @@ function getSelectedDurationSeconds(editPlan: EditPlanArtifact) {
 
       const sourceStart = segment.sourceStart;
       const sourceEnd = segment.sourceEnd;
+      const segmentIndex = segment.segmentIndex;
 
       if (typeof sourceStart !== "number" || typeof sourceEnd !== "number") {
         return total;
       }
 
-      return total + Math.max(0, sourceEnd - sourceStart);
+      const holdAfterActionSeconds =
+        typeof segmentIndex === "number"
+          ? holdSecondsBySegmentIndex.get(segmentIndex) ?? 0
+          : 0;
+
+      return (
+        total +
+        Math.max(0, sourceEnd - sourceStart) +
+        Math.max(0, holdAfterActionSeconds)
+      );
     }, 0)
   );
 }
@@ -2892,7 +3812,10 @@ function formatFfmpegSeconds(value: number) {
   return value.toFixed(3);
 }
 
-function getRenderSegments(editPlan: EditPlanArtifact): RenderSegment[] {
+function getRenderSegments(
+  editPlan: EditPlanArtifact,
+  overlayRenderPlan?: InstructionOverlayRenderPlan | null
+): RenderSegment[] {
   const segments = editPlan.segments;
 
   if (!Array.isArray(segments) || segments.length === 0) {
@@ -2902,6 +3825,10 @@ function getRenderSegments(editPlan: EditPlanArtifact): RenderSegment[] {
       retryable: true,
     });
   }
+
+  const overlayBySegmentIndex = new Map(
+    overlayRenderPlan?.segments.map((segment) => [segment.segmentIndex, segment])
+  );
 
   return segments.map((segment, index) => {
     if (!isRecord(segment)) {
@@ -2914,6 +3841,11 @@ function getRenderSegments(editPlan: EditPlanArtifact): RenderSegment[] {
 
     const sourceStart = segment.sourceStart;
     const sourceEnd = segment.sourceEnd;
+    const segmentIndex =
+      typeof segment.segmentIndex === "number" &&
+      Number.isInteger(segment.segmentIndex)
+        ? segment.segmentIndex
+        : index + 1;
 
     if (
       typeof sourceStart !== "number" ||
@@ -2932,13 +3864,40 @@ function getRenderSegments(editPlan: EditPlanArtifact): RenderSegment[] {
       );
     }
 
+    const overlaySegment = overlayBySegmentIndex.get(segmentIndex);
+    const sourceDurationSeconds = sourceEnd - sourceStart;
+    const holdAfterActionSeconds =
+      overlaySegment?.holdAfterActionSeconds ?? 0;
+
     return {
-      index: index + 1,
+      index: segmentIndex,
       sourceStart,
       sourceEnd,
-      durationSeconds: sourceEnd - sourceStart,
+      sourceDurationSeconds,
+      durationSeconds: sourceDurationSeconds + holdAfterActionSeconds,
+      holdAfterActionSeconds,
+      optionalCrop: overlaySegment?.optionalCrop ?? null,
     };
   });
+}
+
+function buildOptionalCropFilters(
+  optionalCrop: RenderSegment["optionalCrop"],
+  renderDimensions: RenderDimensions
+) {
+  if (!optionalCrop || optionalCrop.type !== "subtle_zoom") {
+    return [];
+  }
+
+  const dimensions = renderDimensions;
+  const scale = optionalCrop.scale.toFixed(4);
+  const xBias = (0.5 + optionalCrop.xPercent / 200).toFixed(4);
+  const yBias = (0.5 + optionalCrop.yPercent / 200).toFixed(4);
+
+  return [
+    `scale=ceil(iw*${scale}/2)*2:ceil(ih*${scale}/2)*2`,
+    `crop=${dimensions.width}:${dimensions.height}:(iw-${dimensions.width})*${xBias}:(ih-${dimensions.height})*${yBias}`,
+  ];
 }
 
 async function assertNonEmptyFile(filePath: string, options: {
@@ -2999,8 +3958,12 @@ async function renderMutedClipEdit(options: {
   editPlan: EditPlanArtifact;
   workDir: string;
   renderDimensions: RenderDimensions;
+  overlayRenderPlan?: InstructionOverlayRenderPlan | null;
 }) {
-  const segments = getRenderSegments(options.editPlan);
+  const segments = getRenderSegments(
+    options.editPlan,
+    options.overlayRenderPlan
+  );
   const segmentFilters = segments.map((segment, index) => {
     const label = `v${index}`;
 
@@ -3010,8 +3973,14 @@ async function renderMutedClipEdit(options: {
       )}:end=${formatFfmpegSeconds(segment.sourceEnd)}`,
       "setpts=PTS-STARTPTS",
       ...buildClipScalePadFilters(options.renderDimensions),
+      ...buildOptionalCropFilters(segment.optionalCrop, options.renderDimensions),
+      segment.holdAfterActionSeconds > 0
+        ? `tpad=stop_mode=clone:stop_duration=${formatFfmpegSeconds(
+            segment.holdAfterActionSeconds
+          )}`
+        : null,
       "format=yuv420p",
-    ];
+    ].filter((filter): filter is string => Boolean(filter));
 
     return `${filters.join(",")}[${label}]`;
   });
@@ -3124,11 +4093,13 @@ async function renderFinalVideo(options: {
   mutedClipEditPath: string;
   voiceoverPath: string;
   subtitlesPath: string;
+  textOverlayPath?: string | null;
   outputPath: string;
   workDir: string;
   subtitleFontsDir?: string;
   requireBurnedSubtitles?: boolean;
 }) {
+  const textOverlayPath = options.textOverlayPath ?? options.subtitlesPath;
   const mutedDurationSeconds = await getMediaDurationSeconds(
     options.mutedClipEditPath,
     "ffprobe_muted_clip_duration_invalid",
@@ -3168,7 +4139,7 @@ async function renderFinalVideo(options: {
       : null,
     supportsBurnedSubtitles
       ? buildBurnedSubtitleFilter({
-          subtitlesPath: options.subtitlesPath,
+          subtitlesPath: textOverlayPath,
           fontsDir: options.subtitleFontsDir,
         })
       : null,
@@ -3176,7 +4147,7 @@ async function renderFinalVideo(options: {
   ].filter((filter): filter is string => Boolean(filter));
   const subtitleInputArgs = supportsBurnedSubtitles
     ? []
-    : ["-i", path.basename(options.subtitlesPath)];
+    : ["-i", path.basename(textOverlayPath)];
   const subtitleMapArgs = supportsBurnedSubtitles ? [] : ["-map", "2:0"];
   const subtitleCodecArgs = supportsBurnedSubtitles
     ? []
@@ -3267,6 +4238,185 @@ async function renderFinalVideo(options: {
     voiceoverDurationSeconds: roundSeconds(voiceoverDurationSeconds),
     finalDurationSeconds: roundSeconds(finalDurationSeconds),
     padDurationSeconds: roundSeconds(padDurationSeconds),
+    sizeBytes: fileStats.size,
+  };
+}
+
+async function prepareMutedClipForFinalRenderer(options: {
+  mutedClipEditPath: string;
+  voiceoverPath: string;
+  paddedMutedClipEditPath: string;
+  workDir: string;
+}) {
+  const mutedDurationSeconds = await getMediaDurationSeconds(
+    options.mutedClipEditPath,
+    "ffprobe_muted_clip_duration_invalid",
+    "Unable to read muted clip duration with ffprobe"
+  );
+  const voiceoverDurationSeconds = await getMediaDurationSeconds(
+    options.voiceoverPath,
+    "ffprobe_voiceover_duration_invalid",
+    "Unable to read voiceover duration with ffprobe"
+  );
+  const padDurationSeconds = Math.max(
+    0,
+    voiceoverDurationSeconds - mutedDurationSeconds
+  );
+
+  if (padDurationSeconds <= 0.05) {
+    return {
+      videoPath: options.mutedClipEditPath,
+      mutedDurationSeconds: roundSeconds(mutedDurationSeconds),
+      voiceoverDurationSeconds: roundSeconds(voiceoverDurationSeconds),
+      paddedDurationSeconds: roundSeconds(mutedDurationSeconds),
+      padDurationSeconds: 0,
+    };
+  }
+
+  await runFfmpeg(
+    [
+      "-y",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      path.basename(options.mutedClipEditPath),
+      "-vf",
+      `tpad=stop_mode=clone:stop_duration=${formatFfmpegSeconds(
+        padDurationSeconds
+      )},format=yuv420p`,
+      "-an",
+      "-c:v",
+      "libx264",
+      "-preset",
+      FINAL_RENDER_PRESET,
+      "-crf",
+      FINAL_RENDER_CRF,
+      "-movflags",
+      "+faststart",
+      path.basename(options.paddedMutedClipEditPath),
+    ],
+    { cwd: options.workDir }
+  );
+
+  await assertNonEmptyFile(options.paddedMutedClipEditPath, {
+    code: "muted_clip_padding_empty",
+    message: "FFmpeg produced an empty padded muted clip edit",
+  });
+
+  const paddedDurationSeconds = await getMediaDurationSeconds(
+    options.paddedMutedClipEditPath,
+    "ffprobe_padded_muted_clip_duration_invalid",
+    "Unable to read padded muted clip duration with ffprobe"
+  );
+
+  return {
+    videoPath: options.paddedMutedClipEditPath,
+    mutedDurationSeconds: roundSeconds(mutedDurationSeconds),
+    voiceoverDurationSeconds: roundSeconds(voiceoverDurationSeconds),
+    paddedDurationSeconds: roundSeconds(paddedDurationSeconds),
+    padDurationSeconds: roundSeconds(padDurationSeconds),
+  };
+}
+
+async function renderInstructionOverlayVideo(options: {
+  mutedClipEditPath: string;
+  voiceoverPath: string;
+  outputPath: string;
+  workDir: string;
+  renderDimensions: RenderDimensions;
+  overlayRenderPlan: InstructionOverlayRenderPlan;
+  videoBitrate: string;
+}) {
+  const paddedMutedClipEditPath = path.join(
+    options.workDir,
+    "muted-edit-padded.mp4"
+  );
+  const preparedVideo = await prepareMutedClipForFinalRenderer({
+    mutedClipEditPath: options.mutedClipEditPath,
+    voiceoverPath: options.voiceoverPath,
+    paddedMutedClipEditPath,
+    workDir: options.workDir,
+  });
+  const durationSeconds = Math.max(
+    preparedVideo.paddedDurationSeconds,
+    preparedVideo.voiceoverDurationSeconds
+  );
+  const durationInFrames = Math.max(1, Math.ceil(durationSeconds * REMOTION_FPS));
+  const entryPoint = path.join(process.cwd(), "src", "remotion", "index.ts");
+  const [{ bundle }, { renderMedia, selectComposition }] = await Promise.all([
+    import("@remotion/bundler"),
+    import("@remotion/renderer"),
+  ]);
+  const serveUrl = await bundle({
+    entryPoint,
+  });
+  const inputProps = {
+    videoSrc: pathToFileURL(preparedVideo.videoPath).href,
+    voiceoverSrc: pathToFileURL(options.voiceoverPath).href,
+    width: options.renderDimensions.width,
+    height: options.renderDimensions.height,
+    fps: REMOTION_FPS,
+    durationInFrames,
+    overlayCues: options.overlayRenderPlan.cues,
+  };
+  const composition = await selectComposition({
+    serveUrl,
+    id: REMOTION_COMPOSITION_ID,
+    inputProps,
+    logLevel: "warn",
+  });
+
+  await renderMedia({
+    composition,
+    serveUrl,
+    codec: "h264",
+    outputLocation: options.outputPath,
+    inputProps,
+    overwrite: true,
+    pixelFormat: "yuv420p",
+    audioBitrate: "192k",
+    videoBitrate: options.videoBitrate,
+    enforceAudioTrack: true,
+    logLevel: "warn",
+  });
+
+  const fileStats = await assertNonEmptyFile(options.outputPath, {
+    code: "remotion_final_render_empty",
+    message: "Remotion produced an empty final video",
+  });
+  const videoStreamCount = await countMediaStreams(options.outputPath, "v");
+  const audioStreamCount = await countMediaStreams(options.outputPath, "a");
+
+  if (videoStreamCount === 0 || audioStreamCount === 0) {
+    throw new WorkerError("Remotion final video is missing video or audio", {
+      code: "remotion_final_render_streams_missing",
+      provider: "remotion",
+      retryable: true,
+    });
+  }
+
+  const finalDurationSeconds = await getMediaDurationSeconds(
+    options.outputPath,
+    "ffprobe_remotion_final_duration_invalid",
+    "Unable to read Remotion final video duration with ffprobe"
+  );
+
+  if (finalDurationSeconds + 0.1 < preparedVideo.voiceoverDurationSeconds) {
+    throw new WorkerError("Remotion final video is shorter than the voiceover", {
+      code: "remotion_final_render_voiceover_cut_off",
+      provider: "remotion",
+      retryable: true,
+    });
+  }
+
+  return {
+    renderer: "remotion",
+    mutedDurationSeconds: preparedVideo.mutedDurationSeconds,
+    voiceoverDurationSeconds: preparedVideo.voiceoverDurationSeconds,
+    finalDurationSeconds: roundSeconds(finalDurationSeconds),
+    padDurationSeconds: preparedVideo.padDurationSeconds,
+    videoBitrate: options.videoBitrate,
     sizeBytes: fileStats.size,
   };
 }
@@ -3861,9 +5011,11 @@ function toWorkerError(error: unknown) {
 export async function runProcessVideo(payload: ProcessVideoPayload) {
   let stage: WorkerStage = "queued";
   let transcriptId: string | null = null;
+  let twelveLabsAnalysisTaskId: string | null = null;
   let geminiVideoEventResponseId: string | null = null;
   let openAiVisualResponseId: string | null = null;
   let openAiEditPlanResponseId: string | null = null;
+  let openAiOverlayPlanResponseId: string | null = null;
   let openAiInstructionDocumentResponseId: string | null = null;
   let openAiScriptResponseId: string | null = null;
   let openAiTtsRequestId: string | null = null;
@@ -3878,6 +5030,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
   const instructionPdfPath = path.join(workDir, "instruction-document.pdf");
   const voiceoverPath = path.join(workDir, "voiceover.mp3");
   const subtitlesPath = path.join(workDir, "subtitles.ass");
+  const instructionOverlayPath = path.join(workDir, "instruction-overlays.ass");
   const mutedClipEditPath = path.join(workDir, "muted-edit.mp4");
   const finalPath = path.join(workDir, "final.mp4");
   const audioR2Key = `artifacts/${payload.videoId}/audio.wav`;
@@ -3902,7 +5055,12 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
       typeof video.target_language === "string" && video.target_language.trim()
         ? video.target_language.trim()
         : DEFAULT_TARGET_LANGUAGE;
-    const geminiConfig = getGeminiConfig();
+    const videoAnalysisConfig = getVideoAnalysisConfig();
+    const videoStyle = getVideoStyle();
+    const renderer = getRenderer();
+    const outputVideoBitrate = getOutputVideoBitrate();
+    const finalRenderer =
+      videoStyle === "instruction_overlay" ? renderer : "ffmpeg";
 
     if (!originalR2Key) {
       throw new WorkerError("Video record is missing an original R2 key", {
@@ -4017,28 +5175,44 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
 
     let videoEventAnalysis: VideoEventAnalysisArtifact | null = null;
 
-    if (geminiConfig.enabled) {
+    if (videoAnalysisConfig.provider !== "openai") {
       stage = "analyzing_video_events";
       await updateStage(payload.videoId, stage);
 
       try {
-        videoEventAnalysis = await analyzeVideoEvents({
-          videoId: payload.videoId,
-          sourceR2Key: originalR2Key,
-          transcriptR2Key,
-          inputPath,
-          originalContentType: getGeminiVideoContentType(
-            video.original_content_type
-          ),
-          prompt,
-          targetLanguage,
-          transcript,
-          durationSeconds: sourceDurationSeconds,
-        });
-        geminiVideoEventResponseId =
-          typeof videoEventAnalysis.providerRequestId === "string"
-            ? videoEventAnalysis.providerRequestId
-            : null;
+        if (videoAnalysisConfig.provider === "twelvelabs") {
+          videoEventAnalysis = await analyzeVideoEventsWithTwelveLabs({
+            videoId: payload.videoId,
+            sourceR2Key: originalR2Key,
+            transcriptR2Key,
+            prompt,
+            targetLanguage,
+            durationSeconds: sourceDurationSeconds,
+          });
+          twelveLabsAnalysisTaskId =
+            typeof videoEventAnalysis.providerRequestId === "string"
+              ? videoEventAnalysis.providerRequestId
+              : null;
+        } else {
+          videoEventAnalysis = await analyzeVideoEvents({
+            videoId: payload.videoId,
+            sourceR2Key: originalR2Key,
+            transcriptR2Key,
+            inputPath,
+            originalContentType: getGeminiVideoContentType(
+              video.original_content_type
+            ),
+            prompt,
+            targetLanguage,
+            transcript,
+            durationSeconds: sourceDurationSeconds,
+          });
+          geminiVideoEventResponseId =
+            typeof videoEventAnalysis.providerRequestId === "string"
+              ? videoEventAnalysis.providerRequestId
+              : null;
+        }
+
         await uploadJsonToR2(videoEventAnalysisR2Key, videoEventAnalysis);
 
         stage = "video_event_analysis_ready";
@@ -4048,9 +5222,13 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
           progress: STAGE_PROGRESS[stage],
           transcript_r2_key: transcriptR2Key,
           video_event_analysis_r2_key: videoEventAnalysisR2Key,
-          provider_request_id: geminiVideoEventResponseId ?? transcriptId,
+          provider_request_id:
+            twelveLabsAnalysisTaskId ??
+            geminiVideoEventResponseId ??
+            transcriptId,
           provider_run_ids: buildProviderRunIds({
             assemblyAiTranscriptId: transcriptId,
+            twelveLabsAnalysisTaskId,
             geminiVideoEventResponseId,
           }),
           error_message: null,
@@ -4059,16 +5237,17 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
           retryable: null,
         });
       } catch (error) {
-        const geminiError = toWorkerError(error);
+        const analysisError = toWorkerError(error);
 
-        if (geminiConfig.required) {
-          throw geminiError;
+        if (videoAnalysisConfig.required) {
+          throw analysisError;
         }
 
         console.warn(
-          `Skipping optional Gemini video event analysis for ${payload.videoId}: ${geminiError.message}`
+          `Skipping optional ${videoAnalysisConfig.provider} video event analysis for ${payload.videoId}: ${analysisError.message}`
         );
         videoEventAnalysis = null;
+        twelveLabsAnalysisTaskId = null;
         geminiVideoEventResponseId = null;
       }
     }
@@ -4113,9 +5292,13 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         : null,
       visual_timeline_r2_key: visualTimelineR2Key,
       provider_request_id:
-        openAiVisualResponseId ?? geminiVideoEventResponseId ?? transcriptId,
+        openAiVisualResponseId ??
+        twelveLabsAnalysisTaskId ??
+        geminiVideoEventResponseId ??
+        transcriptId,
       provider_run_ids: buildProviderRunIds({
         assemblyAiTranscriptId: transcriptId,
+        twelveLabsAnalysisTaskId,
         geminiVideoEventResponseId,
         openAiVisualResponseId,
       }),
@@ -4127,7 +5310,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
 
     stage = "planning_segments";
     await updateStage(payload.videoId, stage);
-    const editPlan = await planTutorialSegments({
+    let editPlan: EditPlanArtifact = await planTutorialSegments({
       videoId: payload.videoId,
       sourceR2Key: originalR2Key,
       transcriptR2Key,
@@ -4146,6 +5329,43 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
       typeof editPlan.providerRequestId === "string"
         ? editPlan.providerRequestId
         : null;
+    let instructionOverlayPlan: InstructionOverlayPlan | null = null;
+    let overlayRenderPlan: InstructionOverlayRenderPlan | null = null;
+
+    if (videoStyle === "instruction_overlay") {
+      const overlayPlanResult = await planInstructionOverlays({
+        videoId: payload.videoId,
+        sourceR2Key: originalR2Key,
+        editPlanR2Key,
+        prompt,
+        targetLanguage,
+        transcript,
+        visualTimeline,
+        videoEventAnalysis,
+        editPlan,
+      });
+      openAiOverlayPlanResponseId =
+        typeof overlayPlanResult.providerRequestId === "string"
+          ? overlayPlanResult.providerRequestId
+          : null;
+      instructionOverlayPlan = overlayPlanResult.instructionOverlayPlan;
+      overlayRenderPlan = buildInstructionOverlayRenderPlan({
+        selectedSegments: getSelectedSegmentReferences(editPlan),
+        overlayPlan: instructionOverlayPlan,
+      });
+      editPlan = {
+        ...editPlan,
+        instructionOverlayPlan,
+        instructionOverlayProvider: {
+          provider: overlayPlanResult.provider,
+          providerRequestId: openAiOverlayPlanResponseId,
+          model: overlayPlanResult.model,
+          completedAt: overlayPlanResult.completedAt,
+        },
+        instructionOverlayRenderPlan: overlayRenderPlan,
+      };
+    }
+
     await uploadJsonToR2(editPlanR2Key, editPlan);
 
     stage = "edit_plan_ready";
@@ -4160,15 +5380,19 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
       visual_timeline_r2_key: visualTimelineR2Key,
       edit_plan_r2_key: editPlanR2Key,
       provider_request_id:
+        openAiOverlayPlanResponseId ??
         openAiEditPlanResponseId ??
         openAiVisualResponseId ??
+        twelveLabsAnalysisTaskId ??
         geminiVideoEventResponseId ??
         transcriptId,
       provider_run_ids: buildProviderRunIds({
         assemblyAiTranscriptId: transcriptId,
+        twelveLabsAnalysisTaskId,
         geminiVideoEventResponseId,
         openAiVisualResponseId,
         openAiEditPlanResponseId,
+        openAiOverlayPlanResponseId,
       }),
       error_message: null,
       error_code: null,
@@ -4239,15 +5463,19 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
       instruction_pdf_r2_key: instructionPdfR2Key,
       provider_request_id:
         openAiInstructionDocumentResponseId ??
+        openAiOverlayPlanResponseId ??
         openAiEditPlanResponseId ??
         openAiVisualResponseId ??
+        twelveLabsAnalysisTaskId ??
         geminiVideoEventResponseId ??
         transcriptId,
       provider_run_ids: buildProviderRunIds({
         assemblyAiTranscriptId: transcriptId,
+        twelveLabsAnalysisTaskId,
         geminiVideoEventResponseId,
         openAiVisualResponseId,
         openAiEditPlanResponseId,
+        openAiOverlayPlanResponseId,
         openAiInstructionDocumentResponseId,
       }),
       error_message: null,
@@ -4299,15 +5527,19 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
       provider_request_id:
         openAiScriptResponseId ??
         openAiInstructionDocumentResponseId ??
+        openAiOverlayPlanResponseId ??
         openAiEditPlanResponseId ??
         openAiVisualResponseId ??
+        twelveLabsAnalysisTaskId ??
         geminiVideoEventResponseId ??
         transcriptId,
       provider_run_ids: buildProviderRunIds({
         assemblyAiTranscriptId: transcriptId,
+        twelveLabsAnalysisTaskId,
         geminiVideoEventResponseId,
         openAiVisualResponseId,
         openAiEditPlanResponseId,
+        openAiOverlayPlanResponseId,
         openAiInstructionDocumentResponseId,
         openAiScriptResponseId,
       }),
@@ -4339,9 +5571,11 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
       provider_request_id: assemblyAiVoiceoverTranscriptId ?? openAiTtsRequestId,
       provider_run_ids: buildProviderRunIds({
         assemblyAiTranscriptId: transcriptId,
+        twelveLabsAnalysisTaskId,
         geminiVideoEventResponseId,
         openAiVisualResponseId,
         openAiEditPlanResponseId,
+        openAiOverlayPlanResponseId,
         openAiInstructionDocumentResponseId,
         openAiScriptResponseId,
         openAiTtsRequestId,
@@ -4386,6 +5620,24 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
     );
     await uploadFileToR2(subtitleR2Key, subtitlesPath, "text/plain");
 
+    if (overlayRenderPlan) {
+      const instructionOverlayCues: InstructionOverlayCue[] =
+        overlayRenderPlan.cues.map((cue) => ({
+          startSeconds: cue.startSeconds,
+          endSeconds: cue.endSeconds,
+          text: cue.text,
+        }));
+
+      await writeFile(
+        instructionOverlayPath,
+        buildAssInstructionOverlayFile(
+          instructionOverlayCues,
+          renderDimensions
+        ),
+        "utf8"
+      );
+    }
+
     stage = "voiceover_subtitles_ready";
     await updateVideo(payload.videoId, {
       status: "processing",
@@ -4405,15 +5657,19 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         assemblyAiVoiceoverTranscriptId ??
         openAiScriptResponseId ??
         openAiInstructionDocumentResponseId ??
+        openAiOverlayPlanResponseId ??
         openAiEditPlanResponseId ??
         openAiVisualResponseId ??
+        twelveLabsAnalysisTaskId ??
         geminiVideoEventResponseId ??
         transcriptId,
       provider_run_ids: buildProviderRunIds({
         assemblyAiTranscriptId: transcriptId,
+        twelveLabsAnalysisTaskId,
         geminiVideoEventResponseId,
         openAiVisualResponseId,
         openAiEditPlanResponseId,
+        openAiOverlayPlanResponseId,
         openAiInstructionDocumentResponseId,
         openAiScriptResponseId,
         openAiTtsRequestId,
@@ -4433,19 +5689,36 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
       editPlan,
       workDir,
       renderDimensions,
+      overlayRenderPlan,
     });
 
     stage = "rendering_final";
     await updateStage(payload.videoId, stage);
-    await renderFinalVideo({
-      mutedClipEditPath,
-      voiceoverPath,
-      subtitlesPath,
-      outputPath: finalPath,
-      workDir,
-      subtitleFontsDir: SUBTITLE_FONTS_DIR,
-      requireBurnedSubtitles: getTargetLanguageCode(targetLanguage) === "zh",
-    });
+
+    if (finalRenderer === "remotion" && overlayRenderPlan) {
+      await renderInstructionOverlayVideo({
+        mutedClipEditPath,
+        voiceoverPath,
+        outputPath: finalPath,
+        workDir,
+        renderDimensions,
+        overlayRenderPlan,
+        videoBitrate: outputVideoBitrate,
+      });
+    } else {
+      await renderFinalVideo({
+        mutedClipEditPath,
+        voiceoverPath,
+        subtitlesPath,
+        textOverlayPath: overlayRenderPlan ? instructionOverlayPath : null,
+        outputPath: finalPath,
+        workDir,
+        subtitleFontsDir: SUBTITLE_FONTS_DIR,
+        requireBurnedSubtitles:
+          Boolean(overlayRenderPlan) ||
+          getTargetLanguageCode(targetLanguage) === "zh",
+      });
+    }
 
     stage = "uploading_final";
     await updateStage(payload.videoId, stage);
@@ -4471,15 +5744,19 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         assemblyAiVoiceoverTranscriptId ??
         openAiScriptResponseId ??
         openAiInstructionDocumentResponseId ??
+        openAiOverlayPlanResponseId ??
         openAiEditPlanResponseId ??
         openAiVisualResponseId ??
+        twelveLabsAnalysisTaskId ??
         geminiVideoEventResponseId ??
         transcriptId,
       provider_run_ids: buildProviderRunIds({
         assemblyAiTranscriptId: transcriptId,
+        twelveLabsAnalysisTaskId,
         geminiVideoEventResponseId,
         openAiVisualResponseId,
         openAiEditPlanResponseId,
+        openAiOverlayPlanResponseId,
         openAiInstructionDocumentResponseId,
         openAiScriptResponseId,
         openAiTtsRequestId,
@@ -4504,8 +5781,10 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         openAiTtsRequestId ??
         openAiScriptResponseId ??
         openAiInstructionDocumentResponseId ??
+        openAiOverlayPlanResponseId ??
         openAiEditPlanResponseId ??
         openAiVisualResponseId ??
+        twelveLabsAnalysisTaskId ??
         geminiVideoEventResponseId ??
         transcriptId,
       retryable: workerError.retryable,

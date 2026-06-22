@@ -9,6 +9,12 @@ export type SubtitleCue = {
   text: string;
 };
 
+export type InstructionOverlayCue = {
+  startSeconds: number;
+  endSeconds: number;
+  text: string;
+};
+
 export type AssSubtitleOptions = {
   fontFamily?: string;
 };
@@ -20,6 +26,11 @@ const BASE_SUBTITLE_MARGIN_X = 80;
 const BASE_SUBTITLE_MARGIN_V = 120;
 const BASE_SUBTITLE_OUTLINE = 4;
 const BASE_SUBTITLE_SHADOW = 1;
+const BASE_OVERLAY_FONT_SIZE = 64;
+const BASE_OVERLAY_MARGIN_X = 96;
+const BASE_OVERLAY_MARGIN_V = 138;
+const BASE_OVERLAY_OUTLINE = 18;
+const BASE_OVERLAY_SHADOW = 1;
 export const DEFAULT_SUBTITLE_FONT_FAMILY = "Noto Sans CJK SC";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -189,6 +200,63 @@ function escapeAssText(text: string) {
     .trim();
 }
 
+function hasWhitespace(text: string) {
+  return /\s/.test(text);
+}
+
+function clampText(value: string, maxLength: number) {
+  const trimmed = value.trim().replace(/\s+/g, " ");
+
+  if (trimmed.length <= maxLength) {
+    return trimmed;
+  }
+
+  return `${trimmed.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
+function splitInstructionCaptionLine(text: string, maxLineLength: number) {
+  if (!hasWhitespace(text)) {
+    return [text.slice(0, maxLineLength), text.slice(maxLineLength)];
+  }
+
+  const words = text.split(/\s+/);
+  const lines: string[] = [];
+  let currentLine = "";
+
+  for (const word of words) {
+    const candidate = currentLine ? `${currentLine} ${word}` : word;
+
+    if (candidate.length <= maxLineLength || !currentLine) {
+      currentLine = candidate;
+      continue;
+    }
+
+    lines.push(currentLine);
+    currentLine = word;
+  }
+
+  if (currentLine) {
+    lines.push(currentLine);
+  }
+
+  return lines;
+}
+
+function clampInstructionCaptionToTwoLines(text: string) {
+  const normalized = clampText(text, 96);
+  const maxLineLength = hasWhitespace(normalized) ? 42 : 24;
+  const lines = splitInstructionCaptionLine(normalized, maxLineLength);
+
+  if (lines.length <= 2) {
+    return lines.join("\n");
+  }
+
+  return [
+    lines[0],
+    clampText(lines.slice(1).join(" "), maxLineLength),
+  ].join("\n");
+}
+
 function sanitizeAssStyleValue(value: string) {
   return value.replace(/,/g, " ").trim();
 }
@@ -243,6 +311,51 @@ export function buildAssSubtitleFile(
     "[V4+ Styles]",
     "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
     `Style: Default,${fontFamily},${fontSize},&H00FFFFFF,&H00FFFFFF,&H00111111,&H99000000,-1,0,0,0,100,100,0,0,1,${outline},${shadow},2,${marginX},${marginX},${marginV},1`,
+    "",
+    "[Events]",
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ...dialogueLines,
+    "",
+  ].join("\n");
+}
+
+export function buildAssInstructionOverlayFile(
+  cues: InstructionOverlayCue[],
+  renderDimensions: RenderDimensions,
+  options: AssSubtitleOptions = {}
+) {
+  const dimensions = normalizeRenderDimensions(renderDimensions);
+  const fontFamily =
+    sanitizeAssStyleValue(options.fontFamily ?? DEFAULT_SUBTITLE_FONT_FAMILY) ||
+    DEFAULT_SUBTITLE_FONT_FAMILY;
+  const fontSize = scaleSubtitleMetric(BASE_OVERLAY_FONT_SIZE, dimensions, 20);
+  const marginX = scaleSubtitleMetric(BASE_OVERLAY_MARGIN_X, dimensions, 18);
+  const marginV = scaleSubtitleMetric(BASE_OVERLAY_MARGIN_V, dimensions, 28);
+  const outline = scaleSubtitleMetric(BASE_OVERLAY_OUTLINE, dimensions, 6);
+  const shadow = scaleSubtitleMetric(BASE_OVERLAY_SHADOW, dimensions, 1);
+  const dialogueLines = cues.map((cue) => {
+    const captionText = escapeAssText(
+      clampInstructionCaptionToTwoLines(cue.text)
+    );
+
+    return `Dialogue: 0,${formatAssTimestamp(
+      cue.startSeconds
+    )},${formatAssTimestamp(
+      cue.endSeconds
+    )},Instruction,,0,0,0,,{\\fad(200,200)}${captionText}`;
+  });
+
+  return [
+    "[Script Info]",
+    "ScriptType: v4.00+",
+    "WrapStyle: 2",
+    "ScaledBorderAndShadow: yes",
+    `PlayResX: ${dimensions.width}`,
+    `PlayResY: ${dimensions.height}`,
+    "",
+    "[V4+ Styles]",
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+    `Style: Instruction,${fontFamily},${fontSize},&H00FFFFFF,&H00FFFFFF,&H00101010,&H99000000,-1,0,0,0,100,100,0,0,3,${outline},${shadow},2,${marginX},${marginX},${marginV},1`,
     "",
     "[Events]",
     "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",

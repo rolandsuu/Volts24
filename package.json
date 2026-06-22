@@ -13,12 +13,16 @@
     "@aws-sdk/client-s3": "^3.1062.0",
     "@aws-sdk/s3-request-presigner": "^3.1062.0",
     "@google/genai": "^2.8.0",
+    "@remotion/bundler": "4.0.481",
+    "@remotion/renderer": "4.0.481",
+    "@remotion/transitions": "4.0.481",
     "@supabase/ssr": "^0.10.3",
     "@supabase/supabase-js": "^2.107.0",
     "@trigger.dev/sdk": "4.4.6",
     "next": "16.2.7",
     "react": "19.2.4",
     "react-dom": "19.2.4",
+    "remotion": "4.0.481",
     "ws": "^8.21.0"
   },
   "devDependencies": {

@@ -18,10 +18,16 @@ OPENAI_API_KEY=
 OPENAI_WORKER_MODEL=gpt-5-mini
 OPENAI_TTS_MODEL=gpt-4o-mini-tts
 OPENAI_TTS_VOICE=cedar
+VIDEO_ANALYSIS_PROVIDER=openai
+TWELVELABS_API_KEY=
+TWELVELABS_ANALYZE_MODEL=pegasus1.5
 GEMINI_API_KEY=
 GEMINI_VIDEO_MODEL=gemini-3.5-flash
 GEMINI_VIDEO_EVENT_ANALYSIS_ENABLED=false
 GEMINI_VIDEO_EVENT_ANALYSIS_REQUIRED=false
+VIDEO_STYLE=instruction_overlay
+RENDERER=ffmpeg
+OUTPUT_VIDEO_BITRATE=8M
 ```
 
 Supabase Auth is used for magic-link sign-in. Add the local and production app
@@ -52,6 +58,12 @@ second AssemblyAI transcription pass over the generated voiceover, so
 `ASSEMBLYAI_API_KEY` is required for both source transcription and subtitle
 timing. OpenAI requires disclosure to end users that they are hearing an
 AI-generated voice.
+`VIDEO_ANALYSIS_PROVIDER` controls the optional whole-video analysis pass. Set
+it to `twelvelabs` for paid timestamped action segmentation, `gemini` for the
+Gemini whole-video fallback, or `openai` to use only the existing transcript plus
+sampled-frame OpenAI visual analysis. `TWELVELABS_API_KEY` is required when
+`VIDEO_ANALYSIS_PROVIDER=twelvelabs`; `TWELVELABS_ANALYZE_MODEL` is optional and
+defaults to `pegasus1.5`.
 `GEMINI_VIDEO_MODEL` is optional and defaults to `gemini-3.5-flash`.
 `GEMINI_VIDEO_EVENT_ANALYSIS_ENABLED` controls optional Gemini whole-video
 event analysis. `GEMINI_VIDEO_EVENT_ANALYSIS_REQUIRED` defaults to `false`; when
@@ -60,6 +72,12 @@ sampled-frame pipeline continues.
 `VISUAL_FRAME_SAMPLE_INTERVAL_SECONDS` and
 `VISUAL_FRAME_SAMPLE_MAX_FRAMES` are optional visual-analysis worker settings
 and default to `3` and `30`.
+`VIDEO_STYLE` defaults to `instruction_overlay`, which adds one readable
+Vidocu-style action caption per selected segment. Set it to
+`voiceover_subtitles` to keep the older voiceover/subtitle presentation.
+`RENDERER` defaults to `ffmpeg`; set `RENDERER=remotion` for the quality
+instruction-overlay renderer. `OUTPUT_VIDEO_BITRATE` is used by the Remotion
+renderer and defaults to `8M`.
 
 Before running the worker against a fresh database, apply the Supabase migrations in `supabase/migrations/` in order.
 For production Gemini rollout, apply
