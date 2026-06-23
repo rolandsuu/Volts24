@@ -101,11 +101,10 @@ function assertOpenAiStrictSchema(schema: unknown, path = "schema") {
     }
 
     for (const key of required) {
-      assert.equal(
-        typeof key,
-        "string",
-        `${path}.required entries must be strings`
-      );
+      if (typeof key !== "string") {
+        assert.fail(`${path}.required entries must be strings`);
+      }
+
       assert.ok(
         propertyKeys.includes(key),
         `${path}.required contains unknown key ${String(key)}`

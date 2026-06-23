@@ -1,18 +1,15 @@
 import { retry, task } from "@trigger.dev/sdk/v3";
-import { GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import {
   FileState,
   GoogleGenAI,
   type File as GeminiFile,
   type Part,
 } from "@google/genai";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createReadStream } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { pipeline } from "node:stream/promises";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -35,7 +32,6 @@ import {
   type InstructionOverlayRenderPlan,
 } from "../lib/instruction-overlay-plan";
 import { DEFAULT_TARGET_LANGUAGE } from "../lib/languages";
-import { r2, R2_BUCKET_NAME } from "../lib/r2";
 import {
   buildSubtitleCues,
   SubtitleCueGenerationError,
@@ -59,6 +55,21 @@ import {
   type RenderDimensions,
   type SubtitleCue,
 } from "../lib/video-rendering";
+import { buildProcessVideoArtifactKeys } from "./process-video-artifacts.ts";
+import {
+  createSignedR2ReadUrl,
+  downloadFromR2,
+  uploadFileToR2,
+  uploadJsonToR2,
+} from "./process-video-r2.ts";
+import type { WorkerStage } from "./process-video-stages.ts";
+import {
+  buildCompletedStageUpdate,
+  buildFailureUpdate,
+  buildInitialProcessingUpdate,
+  buildProviderRunIds,
+  buildSuccessfulStageUpdate,
+} from "./process-video-status.ts";
 
 type ProcessVideoPayload = {
   videoId: string;
@@ -72,30 +83,6 @@ type VideoRow = {
   prompt: string | null;
   target_language: string | null;
 };
-
-type WorkerStage =
-  | "queued"
-  | "downloading_source"
-  | "extracting_audio"
-  | "transcribing_audio"
-  | "transcript_ready"
-  | "analyzing_video_events"
-  | "video_event_analysis_ready"
-  | "sampling_frames"
-  | "analyzing_visuals"
-  | "visual_analysis_ready"
-  | "planning_segments"
-  | "edit_plan_ready"
-  | "writing_instruction_document"
-  | "instruction_document_ready"
-  | "writing_script"
-  | "generating_voiceover"
-  | "building_subtitles"
-  | "voiceover_subtitles_ready"
-  | "cutting_clips"
-  | "rendering_final"
-  | "uploading_final"
-  | "completed";
 
 type AssemblyAiSubmitResponse = {
   id?: unknown;
@@ -158,31 +145,6 @@ type OpenAiImageDetail = "low" | "high" | "auto";
 type VideoAnalysisProvider = "twelvelabs" | "gemini" | "openai";
 type VideoStyle = "instruction_overlay" | "voiceover_subtitles";
 type FinalRenderer = "remotion" | "ffmpeg";
-
-const STAGE_PROGRESS: Record<WorkerStage, number> = {
-  queued: 5,
-  downloading_source: 8,
-  extracting_audio: 12,
-  transcribing_audio: 24,
-  transcript_ready: 24,
-  analyzing_video_events: 30,
-  video_event_analysis_ready: 32,
-  sampling_frames: 36,
-  analyzing_visuals: 50,
-  visual_analysis_ready: 50,
-  planning_segments: 60,
-  edit_plan_ready: 60,
-  writing_instruction_document: 66,
-  instruction_document_ready: 68,
-  writing_script: 72,
-  generating_voiceover: 80,
-  building_subtitles: 86,
-  voiceover_subtitles_ready: 88,
-  cutting_clips: 91,
-  rendering_final: 95,
-  uploading_final: 98,
-  completed: 100,
-};
 
 const ASSEMBLYAI_PROVIDER = "assemblyai";
 const ASSEMBLYAI_DEFAULT_BASE_URL = "https://api.assemblyai.com";
@@ -621,71 +583,7 @@ async function loadVideo(videoId: string) {
 }
 
 async function updateStage(videoId: string, stage: WorkerStage) {
-  await updateVideo(videoId, {
-    status: "processing",
-    current_stage: stage,
-    progress: STAGE_PROGRESS[stage],
-    error_message: null,
-    error_code: null,
-    error_provider: null,
-    provider_request_id: null,
-    retryable: null,
-  });
-}
-
-async function downloadFromR2(key: string, filePath: string) {
-  const result = await r2.send(
-    new GetObjectCommand({
-      Bucket: R2_BUCKET_NAME,
-      Key: key,
-    })
-  );
-
-  if (!result.Body) {
-    throw new Error("R2 object has no body");
-  }
-
-  await pipeline(
-    result.Body as NodeJS.ReadableStream,
-    createWriteStream(filePath)
-  );
-}
-
-async function uploadFileToR2(
-  key: string,
-  filePath: string,
-  contentType: string
-) {
-  await r2.send(
-    new PutObjectCommand({
-      Bucket: R2_BUCKET_NAME,
-      Key: key,
-      Body: createReadStream(filePath),
-      ContentType: contentType,
-    })
-  );
-}
-
-async function uploadJsonToR2(key: string, value: unknown) {
-  await r2.send(
-    new PutObjectCommand({
-      Bucket: R2_BUCKET_NAME,
-      Key: key,
-      Body: JSON.stringify(value, null, 2),
-      ContentType: "application/json",
-    })
-  );
-}
-
-async function createSignedR2ReadUrl(key: string, expiresInSeconds: number) {
-  return getSignedUrl(
-    r2,
-    new GetObjectCommand({
-      Bucket: R2_BUCKET_NAME,
-      Key: key,
-    }),
-    { expiresIn: expiresInSeconds }
-  );
+  await updateVideo(videoId, buildSuccessfulStageUpdate(stage));
 }
 
 function runFfmpeg(args: string[], options?: { cwd?: string }) {
@@ -1633,68 +1531,6 @@ function parseJsonObject(text: string) {
   }
 
   return parsed as Record<string, unknown>;
-}
-
-function buildProviderRunIds(ids: {
-  assemblyAiTranscriptId?: string | null;
-  twelveLabsAnalysisTaskId?: string | null;
-  geminiVideoEventResponseId?: string | null;
-  openAiVisualResponseId?: string | null;
-  openAiEditPlanResponseId?: string | null;
-  openAiOverlayPlanResponseId?: string | null;
-  openAiInstructionDocumentResponseId?: string | null;
-  openAiScriptResponseId?: string | null;
-  openAiTtsRequestId?: string | null;
-  assemblyAiVoiceoverTranscriptId?: string | null;
-}) {
-  const providerRunIds: Record<string, string> = {};
-
-  if (ids.assemblyAiTranscriptId) {
-    providerRunIds.assemblyai_transcript_id = ids.assemblyAiTranscriptId;
-  }
-
-  if (ids.twelveLabsAnalysisTaskId) {
-    providerRunIds.twelvelabs_analysis_task_id = ids.twelveLabsAnalysisTaskId;
-  }
-
-  if (ids.geminiVideoEventResponseId) {
-    providerRunIds.gemini_video_event_response_id =
-      ids.geminiVideoEventResponseId;
-  }
-
-  if (ids.openAiVisualResponseId) {
-    providerRunIds.openai_visual_response_id = ids.openAiVisualResponseId;
-  }
-
-  if (ids.openAiEditPlanResponseId) {
-    providerRunIds.openai_edit_plan_response_id =
-      ids.openAiEditPlanResponseId;
-  }
-
-  if (ids.openAiOverlayPlanResponseId) {
-    providerRunIds.openai_overlay_plan_response_id =
-      ids.openAiOverlayPlanResponseId;
-  }
-
-  if (ids.openAiInstructionDocumentResponseId) {
-    providerRunIds.openai_instruction_document_response_id =
-      ids.openAiInstructionDocumentResponseId;
-  }
-
-  if (ids.openAiScriptResponseId) {
-    providerRunIds.openai_script_response_id = ids.openAiScriptResponseId;
-  }
-
-  if (ids.openAiTtsRequestId) {
-    providerRunIds.openai_tts_request_id = ids.openAiTtsRequestId;
-  }
-
-  if (ids.assemblyAiVoiceoverTranscriptId) {
-    providerRunIds.assemblyai_voiceover_transcript_id =
-      ids.assemblyAiVoiceoverTranscriptId;
-  }
-
-  return providerRunIds;
 }
 
 function compactTranscriptContext(transcript: AssemblyAiTranscriptResponse) {
@@ -4820,16 +4656,18 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
   const mutedClipEditPath = path.join(workDir, "muted-edit.mp4");
   const finalRenderPath = path.join(workDir, "final-render.mp4");
   const finalPath = path.join(workDir, "final.mp4");
-  const audioR2Key = `artifacts/${payload.videoId}/audio.wav`;
-  const transcriptR2Key = `artifacts/${payload.videoId}/transcript.json`;
-  const videoEventAnalysisR2Key = `artifacts/${payload.videoId}/video-event-analysis.json`;
-  const visualTimelineR2Key = `artifacts/${payload.videoId}/visual-timeline.json`;
-  const editPlanR2Key = `artifacts/${payload.videoId}/edit-plan.json`;
-  const instructionPdfR2Key = `artifacts/${payload.videoId}/instruction-document/instructions.pdf`;
-  const voiceoverScriptR2Key = `artifacts/${payload.videoId}/voiceover-script.json`;
-  const voiceoverR2Key = `artifacts/${payload.videoId}/voiceover.mp3`;
-  const subtitleR2Key = `artifacts/${payload.videoId}/subtitles.ass`;
-  const finalR2Key = `videos/${payload.videoId}/final.mp4`;
+  const {
+    audioR2Key,
+    transcriptR2Key,
+    videoEventAnalysisR2Key,
+    visualTimelineR2Key,
+    editPlanR2Key,
+    instructionPdfR2Key,
+    voiceoverScriptR2Key,
+    voiceoverR2Key,
+    subtitleR2Key,
+    finalR2Key,
+  } = buildProcessVideoArtifactKeys(payload.videoId);
 
   try {
     const video = await loadVideo(payload.videoId);
@@ -4861,26 +4699,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
       });
     }
 
-    await updateVideo(payload.videoId, {
-      status: "processing",
-      current_stage: "queued",
-      progress: STAGE_PROGRESS.queued,
-      error_message: null,
-      error_code: null,
-      error_provider: null,
-      provider_request_id: null,
-      retryable: null,
-      transcript_r2_key: null,
-      video_event_analysis_r2_key: null,
-      visual_timeline_r2_key: null,
-      edit_plan_r2_key: null,
-      instruction_doc_r2_key: null,
-      instruction_pdf_r2_key: null,
-      voiceover_script_r2_key: null,
-      subtitle_r2_key: null,
-      final_r2_key: null,
-      provider_run_ids: {},
-    });
+    await updateVideo(payload.videoId, buildInitialProcessingUpdate());
 
     stage = "downloading_source";
     await updateStage(payload.videoId, stage);
@@ -4949,20 +4768,13 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
     });
 
     stage = "transcript_ready";
-    await updateVideo(payload.videoId, {
-      status: "processing",
-      current_stage: stage,
-      progress: STAGE_PROGRESS[stage],
+    await updateVideo(payload.videoId, buildSuccessfulStageUpdate(stage, {
       transcript_r2_key: transcriptR2Key,
       provider_request_id: transcriptId,
       provider_run_ids: buildProviderRunIds({
         assemblyAiTranscriptId: transcriptId,
       }),
-      error_message: null,
-      error_code: null,
-      error_provider: null,
-      retryable: null,
-    });
+    }));
 
     let videoEventAnalysis: VideoEventAnalysisArtifact | null = null;
 
@@ -5007,10 +4819,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         await uploadJsonToR2(videoEventAnalysisR2Key, videoEventAnalysis);
 
         stage = "video_event_analysis_ready";
-        await updateVideo(payload.videoId, {
-          status: "processing",
-          current_stage: stage,
-          progress: STAGE_PROGRESS[stage],
+        await updateVideo(payload.videoId, buildSuccessfulStageUpdate(stage, {
           transcript_r2_key: transcriptR2Key,
           video_event_analysis_r2_key: videoEventAnalysisR2Key,
           provider_request_id:
@@ -5022,11 +4831,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
             twelveLabsAnalysisTaskId,
             geminiVideoEventResponseId,
           }),
-          error_message: null,
-          error_code: null,
-          error_provider: null,
-          retryable: null,
-        });
+        }));
       } catch (error) {
         const analysisError = toWorkerError(error);
 
@@ -5073,10 +4878,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
     await uploadJsonToR2(visualTimelineR2Key, visualTimeline);
 
     stage = "visual_analysis_ready";
-    await updateVideo(payload.videoId, {
-      status: "processing",
-      current_stage: stage,
-      progress: STAGE_PROGRESS[stage],
+    await updateVideo(payload.videoId, buildSuccessfulStageUpdate(stage, {
       transcript_r2_key: transcriptR2Key,
       video_event_analysis_r2_key: videoEventAnalysis
         ? videoEventAnalysisR2Key
@@ -5093,11 +4895,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         geminiVideoEventResponseId,
         openAiVisualResponseId,
       }),
-      error_message: null,
-      error_code: null,
-      error_provider: null,
-      retryable: null,
-    });
+    }));
 
     stage = "planning_segments";
     await updateStage(payload.videoId, stage);
@@ -5160,10 +4958,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
     await uploadJsonToR2(editPlanR2Key, editPlan);
 
     stage = "edit_plan_ready";
-    await updateVideo(payload.videoId, {
-      status: "processing",
-      current_stage: stage,
-      progress: STAGE_PROGRESS[stage],
+    await updateVideo(payload.videoId, buildSuccessfulStageUpdate(stage, {
       transcript_r2_key: transcriptR2Key,
       video_event_analysis_r2_key: videoEventAnalysis
         ? videoEventAnalysisR2Key
@@ -5185,11 +4980,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         openAiEditPlanResponseId,
         openAiOverlayPlanResponseId,
       }),
-      error_message: null,
-      error_code: null,
-      error_provider: null,
-      retryable: null,
-    });
+    }));
 
     stage = "writing_instruction_document";
     await updateStage(payload.videoId, stage);
@@ -5241,10 +5032,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
     );
 
     stage = "instruction_document_ready";
-    await updateVideo(payload.videoId, {
-      status: "processing",
-      current_stage: stage,
-      progress: STAGE_PROGRESS[stage],
+    await updateVideo(payload.videoId, buildSuccessfulStageUpdate(stage, {
       transcript_r2_key: transcriptR2Key,
       video_event_analysis_r2_key: videoEventAnalysis
         ? videoEventAnalysisR2Key
@@ -5269,11 +5057,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         openAiOverlayPlanResponseId,
         openAiInstructionDocumentResponseId,
       }),
-      error_message: null,
-      error_code: null,
-      error_provider: null,
-      retryable: null,
-    });
+    }));
 
     const brandLanguageContext = await resolveBrandLanguageContext(
       payload.videoId,
@@ -5303,10 +5087,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         : null;
     await uploadJsonToR2(voiceoverScriptR2Key, voiceoverScript);
 
-    await updateVideo(payload.videoId, {
-      status: "processing",
-      current_stage: stage,
-      progress: STAGE_PROGRESS[stage],
+    await updateVideo(payload.videoId, buildSuccessfulStageUpdate(stage, {
       transcript_r2_key: transcriptR2Key,
       video_event_analysis_r2_key: videoEventAnalysis
         ? videoEventAnalysisR2Key
@@ -5334,11 +5115,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         openAiInstructionDocumentResponseId,
         openAiScriptResponseId,
       }),
-      error_message: null,
-      error_code: null,
-      error_provider: null,
-      retryable: null,
-    });
+    }));
 
     stage = "generating_voiceover";
     await updateStage(payload.videoId, stage);
@@ -5430,10 +5207,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
     }
 
     stage = "voiceover_subtitles_ready";
-    await updateVideo(payload.videoId, {
-      status: "processing",
-      current_stage: stage,
-      progress: STAGE_PROGRESS[stage],
+    await updateVideo(payload.videoId, buildSuccessfulStageUpdate(stage, {
       transcript_r2_key: transcriptR2Key,
       video_event_analysis_r2_key: videoEventAnalysis
         ? videoEventAnalysisR2Key
@@ -5466,11 +5240,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         openAiTtsRequestId,
         assemblyAiVoiceoverTranscriptId,
       }),
-      error_message: null,
-      error_code: null,
-      error_provider: null,
-      retryable: null,
-    });
+    }));
 
     stage = "cutting_clips";
     await updateStage(payload.videoId, stage);
@@ -5534,10 +5304,7 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
     await uploadFileToR2(finalR2Key, finalPath, "video/mp4");
 
     stage = "completed";
-    await updateVideo(payload.videoId, {
-      status: "completed",
-      current_stage: stage,
-      progress: STAGE_PROGRESS[stage],
+    await updateVideo(payload.videoId, buildCompletedStageUpdate({
       transcript_r2_key: transcriptR2Key,
       video_event_analysis_r2_key: videoEventAnalysis
         ? videoEventAnalysisR2Key
@@ -5571,33 +5338,27 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         openAiTtsRequestId,
         assemblyAiVoiceoverTranscriptId,
       }),
-      error_message: null,
-      error_code: null,
-      error_provider: null,
-      retryable: null,
-    });
+    }));
   } catch (error) {
     const workerError = toWorkerError(error);
-    await updateVideo(payload.videoId, {
-      status: "failed",
-      current_stage: stage,
-      error_message: workerError.message,
-      error_code: workerError.code,
-      error_provider: workerError.provider,
-      provider_request_id:
+    await updateVideo(
+      payload.videoId,
+      buildFailureUpdate(
+        stage,
+        workerError,
         workerError.providerRequestId ??
-        assemblyAiVoiceoverTranscriptId ??
-        openAiTtsRequestId ??
-        openAiScriptResponseId ??
-        openAiInstructionDocumentResponseId ??
-        openAiOverlayPlanResponseId ??
-        openAiEditPlanResponseId ??
-        openAiVisualResponseId ??
-        twelveLabsAnalysisTaskId ??
-        geminiVideoEventResponseId ??
-        transcriptId,
-      retryable: workerError.retryable,
-    });
+          assemblyAiVoiceoverTranscriptId ??
+          openAiTtsRequestId ??
+          openAiScriptResponseId ??
+          openAiInstructionDocumentResponseId ??
+          openAiOverlayPlanResponseId ??
+          openAiEditPlanResponseId ??
+          openAiVisualResponseId ??
+          twelveLabsAnalysisTaskId ??
+          geminiVideoEventResponseId ??
+          transcriptId
+      )
+    );
 
     throw error;
   } finally {
