@@ -33,9 +33,6 @@ GEMINI_VIDEO_MODEL=gemini-3.5-flash
 GEMINI_VIDEO_EVENT_ANALYSIS_ENABLED=false
 GEMINI_VIDEO_EVENT_ANALYSIS_REQUIRED=false
 VIDEO_STYLE=instruction_overlay
-RENDERER=ffmpeg
-EXPERIMENTAL_REMOTION_RENDERER=false
-OUTPUT_VIDEO_BITRATE=8M
 ```
 
 Supabase Auth is used for magic-link sign-in. Add the local and production app
@@ -91,12 +88,6 @@ and default to `3` and `30`.
 `VIDEO_STYLE` defaults to `instruction_overlay`, which adds one readable
 Vidocu-style action caption per selected segment. Set it to
 `voiceover_subtitles` to keep the older voiceover/subtitle presentation.
-`RENDERER` defaults to `ffmpeg`. The Remotion renderer is experimental because
-the worker currently produces per-run temporary media files, while Remotion media
-inputs should be served through supported URLs or static assets. `RENDERER` is
-only allowed to select Remotion when `EXPERIMENTAL_REMOTION_RENDERER=true`;
-otherwise final video rendering stays on FFmpeg. `OUTPUT_VIDEO_BITRATE` is used
-by the Remotion renderer and defaults to `8M`.
 
 Before running the worker against a fresh database, apply the Supabase migrations in `supabase/migrations/` in order.
 For production Gemini rollout, apply

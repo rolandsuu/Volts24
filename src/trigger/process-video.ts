@@ -10,7 +10,6 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { pathToFileURL } from "node:url";
 
 import {
   INSTRUCTION_DOCUMENT_SCHEMA,
@@ -57,10 +56,7 @@ import {
 import { buildProcessVideoArtifactKeys } from "./process-video-artifacts.ts";
 import {
   buildFinalVoiceoverSubtitleRenderOptions,
-  DEFAULT_RENDERER,
   DEFAULT_VIDEO_STYLE,
-  selectFinalRenderProvider,
-  type FinalRenderer,
   type VideoStyle,
 } from "./process-video-rendering.ts";
 import {
@@ -213,10 +209,6 @@ const MAX_EDIT_PLAN_WORDS = 300;
 const MIN_EDIT_SEGMENT_DURATION_SECONDS = 0.25;
 const FINAL_RENDER_CRF = "14";
 const FINAL_RENDER_PRESET = "medium";
-const DEFAULT_OUTPUT_VIDEO_BITRATE = "8M";
-const EXPERIMENTAL_REMOTION_RENDERER_ENV = "EXPERIMENTAL_REMOTION_RENDERER";
-const REMOTION_COMPOSITION_ID = "InstructionVideo";
-const REMOTION_FPS = 30;
 const MAX_INSTRUCTION_DOCUMENT_STEPS = 12;
 const INSTRUCTION_FRAME_WIDTH = 1280;
 const SUBTITLE_FONTS_DIR = path.join(process.cwd(), "assets", "fonts");
@@ -745,22 +737,6 @@ function getVideoStyle() {
     ["instruction_overlay", "voiceover_subtitles"],
     DEFAULT_VIDEO_STYLE
   );
-}
-
-function getRenderer() {
-  return getEnumEnv<FinalRenderer>(
-    "RENDERER",
-    ["remotion", "ffmpeg"],
-    DEFAULT_RENDERER
-  );
-}
-
-function getExperimentalRemotionRendererEnabled() {
-  return getBooleanEnv(EXPERIMENTAL_REMOTION_RENDERER_ENV, false);
-}
-
-function getOutputVideoBitrate() {
-  return getOptionalStringEnv("OUTPUT_VIDEO_BITRATE") ?? DEFAULT_OUTPUT_VIDEO_BITRATE;
 }
 
 function getOpenAiMaxOutputTokens() {
@@ -4277,185 +4253,6 @@ async function renderFinalVideo(options: {
   };
 }
 
-async function prepareMutedClipForFinalRenderer(options: {
-  mutedClipEditPath: string;
-  voiceoverPath: string;
-  paddedMutedClipEditPath: string;
-  workDir: string;
-}) {
-  const mutedDurationSeconds = await getMediaDurationSeconds(
-    options.mutedClipEditPath,
-    "ffprobe_muted_clip_duration_invalid",
-    "Unable to read muted clip duration with ffprobe"
-  );
-  const voiceoverDurationSeconds = await getMediaDurationSeconds(
-    options.voiceoverPath,
-    "ffprobe_voiceover_duration_invalid",
-    "Unable to read voiceover duration with ffprobe"
-  );
-  const padDurationSeconds = Math.max(
-    0,
-    voiceoverDurationSeconds - mutedDurationSeconds
-  );
-
-  if (padDurationSeconds <= 0.05) {
-    return {
-      videoPath: options.mutedClipEditPath,
-      mutedDurationSeconds: roundSeconds(mutedDurationSeconds),
-      voiceoverDurationSeconds: roundSeconds(voiceoverDurationSeconds),
-      paddedDurationSeconds: roundSeconds(mutedDurationSeconds),
-      padDurationSeconds: 0,
-    };
-  }
-
-  await runFfmpeg(
-    [
-      "-y",
-      "-hide_banner",
-      "-loglevel",
-      "error",
-      "-i",
-      path.basename(options.mutedClipEditPath),
-      "-vf",
-      `tpad=stop_mode=clone:stop_duration=${formatFfmpegSeconds(
-        padDurationSeconds
-      )},format=yuv420p`,
-      "-an",
-      "-c:v",
-      "libx264",
-      "-preset",
-      FINAL_RENDER_PRESET,
-      "-crf",
-      FINAL_RENDER_CRF,
-      "-movflags",
-      "+faststart",
-      path.basename(options.paddedMutedClipEditPath),
-    ],
-    { cwd: options.workDir }
-  );
-
-  await assertNonEmptyFile(options.paddedMutedClipEditPath, {
-    code: "muted_clip_padding_empty",
-    message: "FFmpeg produced an empty padded muted clip edit",
-  });
-
-  const paddedDurationSeconds = await getMediaDurationSeconds(
-    options.paddedMutedClipEditPath,
-    "ffprobe_padded_muted_clip_duration_invalid",
-    "Unable to read padded muted clip duration with ffprobe"
-  );
-
-  return {
-    videoPath: options.paddedMutedClipEditPath,
-    mutedDurationSeconds: roundSeconds(mutedDurationSeconds),
-    voiceoverDurationSeconds: roundSeconds(voiceoverDurationSeconds),
-    paddedDurationSeconds: roundSeconds(paddedDurationSeconds),
-    padDurationSeconds: roundSeconds(padDurationSeconds),
-  };
-}
-
-async function renderInstructionOverlayVideo(options: {
-  mutedClipEditPath: string;
-  voiceoverPath: string;
-  outputPath: string;
-  workDir: string;
-  renderDimensions: RenderDimensions;
-  overlayRenderPlan: InstructionOverlayRenderPlan;
-  videoBitrate: string;
-}) {
-  const paddedMutedClipEditPath = path.join(
-    options.workDir,
-    "muted-edit-padded.mp4"
-  );
-  const preparedVideo = await prepareMutedClipForFinalRenderer({
-    mutedClipEditPath: options.mutedClipEditPath,
-    voiceoverPath: options.voiceoverPath,
-    paddedMutedClipEditPath,
-    workDir: options.workDir,
-  });
-  const durationSeconds = Math.max(
-    preparedVideo.paddedDurationSeconds,
-    preparedVideo.voiceoverDurationSeconds
-  );
-  const durationInFrames = Math.max(1, Math.ceil(durationSeconds * REMOTION_FPS));
-  const entryPoint = path.join(process.cwd(), "src", "remotion", "index.ts");
-  const [{ bundle }, { renderMedia, selectComposition }] = await Promise.all([
-    import("@remotion/bundler"),
-    import("@remotion/renderer"),
-  ]);
-  const serveUrl = await bundle({
-    entryPoint,
-  });
-  const inputProps = {
-    videoSrc: pathToFileURL(preparedVideo.videoPath).href,
-    voiceoverSrc: pathToFileURL(options.voiceoverPath).href,
-    width: options.renderDimensions.width,
-    height: options.renderDimensions.height,
-    fps: REMOTION_FPS,
-    durationInFrames,
-    overlayCues: options.overlayRenderPlan.cues,
-  };
-  const composition = await selectComposition({
-    serveUrl,
-    id: REMOTION_COMPOSITION_ID,
-    inputProps,
-    logLevel: "warn",
-  });
-
-  await renderMedia({
-    composition,
-    serveUrl,
-    codec: "h264",
-    outputLocation: options.outputPath,
-    inputProps,
-    overwrite: true,
-    pixelFormat: "yuv420p",
-    audioBitrate: "192k",
-    videoBitrate: options.videoBitrate,
-    enforceAudioTrack: true,
-    logLevel: "warn",
-  });
-
-  const fileStats = await assertNonEmptyFile(options.outputPath, {
-    code: "remotion_final_render_empty",
-    message: "Remotion produced an empty final video",
-  });
-  const videoStreamCount = await countMediaStreams(options.outputPath, "v");
-  const audioStreamCount = await countMediaStreams(options.outputPath, "a");
-
-  if (videoStreamCount === 0 || audioStreamCount === 0) {
-    throw new WorkerError("Remotion final video is missing video or audio", {
-      code: "remotion_final_render_streams_missing",
-      provider: "remotion",
-      retryable: true,
-    });
-  }
-
-  const finalDurationSeconds = await getMediaDurationSeconds(
-    options.outputPath,
-    "ffprobe_remotion_final_duration_invalid",
-    "Unable to read Remotion final video duration with ffprobe"
-  );
-
-  if (finalDurationSeconds + 0.1 < preparedVideo.voiceoverDurationSeconds) {
-    throw new WorkerError("Remotion final video is shorter than the voiceover", {
-      code: "remotion_final_render_voiceover_cut_off",
-      provider: "remotion",
-      retryable: true,
-    });
-  }
-
-  return {
-    renderer: "remotion",
-    mutedDurationSeconds: preparedVideo.mutedDurationSeconds,
-    voiceoverDurationSeconds: preparedVideo.voiceoverDurationSeconds,
-    finalDurationSeconds: roundSeconds(finalDurationSeconds),
-    padDurationSeconds: preparedVideo.padDurationSeconds,
-    videoBitrate: options.videoBitrate,
-    sizeBytes: fileStats.size,
-  };
-}
-
 async function extractInstructionDocumentFrames(options: {
   videoId: string;
   inputPath: string;
@@ -4590,10 +4387,7 @@ function toWorkerError(error: unknown) {
   });
 }
 
-function toFinalRenderWorkerError(
-  error: unknown,
-  provider: "ffmpeg" | "remotion"
-) {
+function toFinalRenderWorkerError(error: unknown, provider: "ffmpeg") {
   if (error instanceof WorkerError) {
     return error;
   }
@@ -4602,10 +4396,7 @@ function toFinalRenderWorkerError(
     error instanceof Error ? error.message : "Final video render failed";
 
   return new WorkerError(message, {
-    code:
-      provider === "remotion"
-        ? "remotion_final_render_failed"
-        : "ffmpeg_final_render_failed",
+    code: "ffmpeg_final_render_failed",
     provider,
     retryable: true,
   });
@@ -4662,14 +4453,6 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         : DEFAULT_TARGET_LANGUAGE;
     const videoAnalysisConfig = getVideoAnalysisConfig();
     const videoStyle = getVideoStyle();
-    const renderer = getRenderer();
-    const experimentalRemotionRendererEnabled =
-      getExperimentalRemotionRendererEnabled();
-    const outputVideoBitrate = getOutputVideoBitrate();
-    const finalRenderer =
-      videoStyle === "instruction_overlay" && experimentalRemotionRendererEnabled
-        ? renderer
-        : "ffmpeg";
 
     if (!originalR2Key) {
       throw new WorkerError("Video record is missing an original R2 key", {
@@ -5218,37 +5001,20 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
     stage = "rendering_final";
     await updateStage(payload.videoId, stage);
 
-    const finalRenderProvider = selectFinalRenderProvider({
-      requestedRenderer: finalRenderer,
-      hasOverlayRenderPlan: Boolean(overlayRenderPlan),
-      voiceoverSubtitlesRequired: true,
-    });
     const finalVoiceoverSubtitleRenderOptions =
       buildFinalVoiceoverSubtitleRenderOptions({ subtitlesPath });
 
     try {
-      if (finalRenderProvider === "remotion" && overlayRenderPlan) {
-        await renderInstructionOverlayVideo({
-          mutedClipEditPath,
-          voiceoverPath,
-          outputPath: finalRenderPath,
-          workDir,
-          renderDimensions,
-          overlayRenderPlan,
-          videoBitrate: outputVideoBitrate,
-        });
-      } else {
-        await renderFinalVideo({
-          mutedClipEditPath,
-          voiceoverPath,
-          ...finalVoiceoverSubtitleRenderOptions,
-          outputPath: finalRenderPath,
-          workDir,
-          subtitleFontsDir: SUBTITLE_FONTS_DIR,
-        });
-      }
+      await renderFinalVideo({
+        mutedClipEditPath,
+        voiceoverPath,
+        ...finalVoiceoverSubtitleRenderOptions,
+        outputPath: finalRenderPath,
+        workDir,
+        subtitleFontsDir: SUBTITLE_FONTS_DIR,
+      });
     } catch (error) {
-      throw toFinalRenderWorkerError(error, finalRenderProvider);
+      throw toFinalRenderWorkerError(error, "ffmpeg");
     }
 
     try {
