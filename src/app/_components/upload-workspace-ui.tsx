@@ -1,5 +1,14 @@
 import Link from "next/link";
-import type { ChangeEvent, DragEvent, FormEvent, ReactNode } from "react";
+import {
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type DragEvent,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 
 import {
   TARGET_LANGUAGE_OPTIONS,
@@ -209,6 +218,127 @@ function HelpIcon({ className }: { className?: string }) {
   );
 }
 
+function UploadStepIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 48 48"
+      fill="none"
+      aria-hidden="true"
+    >
+      <rect
+        x="8"
+        y="12"
+        width="32"
+        height="24"
+        rx="4"
+        className="fill-white stroke-current"
+        strokeWidth="2"
+      />
+      <path
+        d="M24 30V18m0 0-5 5m5-5 5 5"
+        className="stroke-current"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2.4"
+      />
+      <path
+        d="M16 34h16"
+        className="stroke-current"
+        strokeLinecap="round"
+        strokeWidth="2"
+      />
+    </svg>
+  );
+}
+
+function PromptStepIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 48 48"
+      fill="none"
+      aria-hidden="true"
+    >
+      <rect
+        x="9"
+        y="10"
+        width="30"
+        height="28"
+        rx="4"
+        className="fill-white stroke-current"
+        strokeWidth="2"
+      />
+      <path
+        d="M16 18h16M16 24h12M16 30h9"
+        className="stroke-current"
+        strokeLinecap="round"
+        strokeWidth="2.4"
+      />
+      <path
+        d="M31.5 29.5 36 34"
+        className="stroke-current"
+        strokeLinecap="round"
+        strokeWidth="2.4"
+      />
+    </svg>
+  );
+}
+
+function LanguageStepIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 48 48"
+      fill="none"
+      aria-hidden="true"
+    >
+      <circle
+        cx="24"
+        cy="24"
+        r="15"
+        className="fill-white stroke-current"
+        strokeWidth="2"
+      />
+      <path
+        d="M10 24h28M24 9c4 4.4 6 9.4 6 15s-2 10.6-6 15M24 9c-4 4.4-6 9.4-6 15s2 10.6 6 15"
+        className="stroke-current"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2"
+      />
+    </svg>
+  );
+}
+
+function GenerateStepIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 48 48"
+      fill="none"
+      aria-hidden="true"
+    >
+      <rect
+        x="8"
+        y="14"
+        width="32"
+        height="22"
+        rx="4"
+        className="fill-white stroke-current"
+        strokeWidth="2"
+      />
+      <path d="M21 20v10l8-5z" className="fill-current" />
+      <path
+        d="M35 9v6M32 12h6M12 9v4M10 11h4"
+        className="stroke-current"
+        strokeLinecap="round"
+        strokeWidth="2.2"
+      />
+    </svg>
+  );
+}
+
 function UserIcon({ className }: { className?: string }) {
   return (
     <svg
@@ -226,6 +356,29 @@ function UserIcon({ className }: { className?: string }) {
     </svg>
   );
 }
+
+const HELP_TUTORIAL_STEPS = [
+  {
+    title: "上传视频",
+    description: "点击上传区域，或把视频拖进去。",
+    Icon: UploadStepIcon,
+  },
+  {
+    title: "写提示词",
+    description: "简单说明你想让 AI 剪出什么效果。",
+    Icon: PromptStepIcon,
+  },
+  {
+    title: "选择语言",
+    description: "选择最终视频和说明文档的语言。",
+    Icon: LanguageStepIcon,
+  },
+  {
+    title: "一键剪辑",
+    description: "等待处理完成后下载视频或操作 PDF。",
+    Icon: GenerateStepIcon,
+  },
+] as const;
 
 function FileThumb() {
   return (
@@ -347,8 +500,43 @@ export function AppHeader({
     label: "历史任务",
   },
 }: AppHeaderProps) {
+  const [isHelpOpen, setIsHelpOpen] = useState(false);
+  const helpPanelId = useId();
+  const helpWrapRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!isHelpOpen) {
+      return;
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setIsHelpOpen(false);
+      }
+    }
+
+    function handlePointerDown(event: PointerEvent) {
+      const target = event.target;
+
+      if (
+        target instanceof Node &&
+        !helpWrapRef.current?.contains(target)
+      ) {
+        setIsHelpOpen(false);
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("pointerdown", handlePointerDown);
+
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("pointerdown", handlePointerDown);
+    };
+  }, [isHelpOpen]);
+
   return (
-    <header className="border-b border-[#d5dbe5] bg-white">
+    <header className="relative z-20 border-b border-[#d5dbe5] bg-white">
       <div className="flex h-16 items-center justify-between px-5 sm:px-8">
         <div className="flex min-w-0 items-center gap-4">
           <div className="flex min-w-0 items-center gap-4">
@@ -369,13 +557,59 @@ export function AppHeader({
           >
             {navLink.label}
           </Link>
-          <button
-            type="button"
-            className="flex h-9 w-9 items-center justify-center rounded-full border border-[#aeb7c5] text-[#586273] transition hover:border-[#11131a] hover:text-[#11131a]"
-            aria-label="帮助"
-          >
-            <HelpIcon className="h-5 w-5" />
-          </button>
+          <div ref={helpWrapRef} className="relative">
+            <button
+              type="button"
+              className={cx(
+                "flex h-9 w-9 items-center justify-center rounded-full border transition hover:border-[#11131a] hover:text-[#11131a] focus:outline-none focus:ring-4 focus:ring-[#11131a]/10",
+                isHelpOpen
+                  ? "border-[#11131a] bg-[#11131a] text-white"
+                  : "border-[#aeb7c5] text-[#586273]"
+              )}
+              aria-label="帮助"
+              aria-expanded={isHelpOpen}
+              aria-controls={helpPanelId}
+              onClick={() => setIsHelpOpen((current) => !current)}
+            >
+              <HelpIcon className="h-5 w-5" />
+            </button>
+
+            {isHelpOpen && (
+              <div
+                id={helpPanelId}
+                role="dialog"
+                aria-label="怎么使用 Volts24"
+                className="absolute right-[-56px] top-12 w-[min(calc(100vw-2rem),360px)] rounded-lg border border-[#d5dbe5] bg-white p-4 text-left text-[#11131a] shadow-[0_18px_45px_rgba(17,19,26,0.16)] sm:right-0"
+              >
+                <div className="absolute right-[67px] top-[-7px] h-3.5 w-3.5 rotate-45 border-l border-t border-[#d5dbe5] bg-white sm:right-3" />
+                <div className="relative">
+                  <p className="text-base font-bold text-[#11131a]">
+                    怎么使用 Volts24
+                  </p>
+                  <div className="mt-3 grid gap-3">
+                    {HELP_TUTORIAL_STEPS.map((step, index) => (
+                      <div
+                        key={step.title}
+                        className="grid grid-cols-[48px_minmax(0,1fr)] gap-3"
+                      >
+                        <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-[#f4f6fa] text-[#11131a]">
+                          <step.Icon className="h-9 w-9" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-sm font-bold text-[#11131a]">
+                            {index + 1}. {step.title}
+                          </p>
+                          <p className="mt-1 text-sm leading-5 text-[#586273]">
+                            {step.description}
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
           <button
             type="button"
             className="flex h-9 w-9 items-center justify-center rounded-full border border-[#aeb7c5] text-[#586273] transition hover:border-[#11131a] hover:text-[#11131a]"
