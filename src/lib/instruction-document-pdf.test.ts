@@ -118,6 +118,7 @@ test("renderInstructionDocumentPdf does not require PDFKit Helvetica AFM data", 
   const originalReadFileSync = fs.readFileSync;
 
   fs.readFileSync = function readFileSyncWithoutHelveticaAfm(
+    this: typeof fs,
     file: fs.PathOrFileDescriptor,
     options?: BufferEncoding | { encoding?: BufferEncoding | null; flag?: string } | null
   ) {
