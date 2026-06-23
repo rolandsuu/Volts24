@@ -39,7 +39,6 @@ import {
 import { DEFAULT_UPLOAD_PROMPT } from "../lib/upload-settings";
 import { addSmoothBouncingWatermark } from "../lib/smooth-bouncing-watermark";
 import { supabaseAdmin } from "../lib/supabase-admin";
-import { getTargetLanguageCode } from "../lib/target-language";
 import {
   VIDEO_EVENT_ANALYSIS_SCHEMA,
   VideoEventAnalysisValidationError,
@@ -48,15 +47,21 @@ import {
 } from "../lib/video-event-analysis";
 import { buildVoiceoverAlignmentFromTranscript } from "../lib/voiceover-alignment";
 import {
-  buildAssInstructionOverlayFile,
   buildAssSubtitleFile,
   buildClipScalePadFilters,
   readRenderDimensionsFromFfprobe,
-  type InstructionOverlayCue,
   type RenderDimensions,
   type SubtitleCue,
 } from "../lib/video-rendering";
 import { buildProcessVideoArtifactKeys } from "./process-video-artifacts.ts";
+import {
+  buildFinalVoiceoverSubtitleRenderOptions,
+  DEFAULT_RENDERER,
+  DEFAULT_VIDEO_STYLE,
+  selectFinalRenderProvider,
+  type FinalRenderer,
+  type VideoStyle,
+} from "./process-video-rendering.ts";
 import {
   createSignedR2ReadUrl,
   downloadFromR2,
@@ -144,9 +149,6 @@ type OpenAiResponsesResponse = {
 type OpenAiReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh";
 type OpenAiImageDetail = "low" | "high" | "auto";
 type VideoAnalysisProvider = "twelvelabs" | "gemini" | "openai";
-type VideoStyle = "instruction_overlay" | "voiceover_subtitles";
-type FinalRenderer = "remotion" | "ffmpeg";
-
 const ASSEMBLYAI_PROVIDER = "assemblyai";
 const ASSEMBLYAI_DEFAULT_BASE_URL = "https://api.assemblyai.com";
 const ASSEMBLYAI_TRANSCRIPT_TIMEOUT_MS = 25 * 60 * 1000;
@@ -210,8 +212,6 @@ const MAX_EDIT_PLAN_WORDS = 300;
 const MIN_EDIT_SEGMENT_DURATION_SECONDS = 0.25;
 const FINAL_RENDER_CRF = "14";
 const FINAL_RENDER_PRESET = "medium";
-const DEFAULT_VIDEO_STYLE: VideoStyle = "instruction_overlay";
-const DEFAULT_RENDERER: FinalRenderer = "ffmpeg";
 const DEFAULT_OUTPUT_VIDEO_BITRATE = "8M";
 const EXPERIMENTAL_REMOTION_RENDERER_ENV = "EXPERIMENTAL_REMOTION_RENDERER";
 const REMOTION_COMPOSITION_ID = "InstructionVideo";
@@ -4148,13 +4148,11 @@ async function renderFinalVideo(options: {
   mutedClipEditPath: string;
   voiceoverPath: string;
   subtitlesPath: string;
-  textOverlayPath?: string | null;
   outputPath: string;
   workDir: string;
   subtitleFontsDir?: string;
   requireBurnedSubtitles?: boolean;
 }) {
-  const textOverlayPath = options.textOverlayPath ?? options.subtitlesPath;
   const mutedDurationSeconds = await getMediaDurationSeconds(
     options.mutedClipEditPath,
     "ffprobe_muted_clip_duration_invalid",
@@ -4173,7 +4171,7 @@ async function renderFinalVideo(options: {
 
   if (!supportsBurnedSubtitles && options.requireBurnedSubtitles) {
     throw new WorkerError(
-      "FFmpeg subtitles filter is required for Chinese subtitles",
+      "FFmpeg subtitles filter is required for burned voiceover subtitles",
       {
         code: "ffmpeg_subtitles_filter_missing",
         provider: "ffmpeg",
@@ -4194,7 +4192,7 @@ async function renderFinalVideo(options: {
       : null,
     supportsBurnedSubtitles
       ? buildBurnedSubtitleFilter({
-          subtitlesPath: textOverlayPath,
+          subtitlesPath: options.subtitlesPath,
           fontsDir: options.subtitleFontsDir,
         })
       : null,
@@ -4202,7 +4200,7 @@ async function renderFinalVideo(options: {
   ].filter((filter): filter is string => Boolean(filter));
   const subtitleInputArgs = supportsBurnedSubtitles
     ? []
-    : ["-i", path.basename(textOverlayPath)];
+    : ["-i", path.basename(options.subtitlesPath)];
   const subtitleMapArgs = supportsBurnedSubtitles ? [] : ["-map", "2:0"];
   const subtitleCodecArgs = supportsBurnedSubtitles
     ? []
@@ -4653,7 +4651,6 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
   const instructionPdfPath = path.join(workDir, "instruction-document.pdf");
   const voiceoverPath = path.join(workDir, "voiceover.mp3");
   const subtitlesPath = path.join(workDir, "subtitles.ass");
-  const instructionOverlayPath = path.join(workDir, "instruction-overlays.ass");
   const mutedClipEditPath = path.join(workDir, "muted-edit.mp4");
   const finalRenderPath = path.join(workDir, "final-render.mp4");
   const finalPath = path.join(workDir, "final.mp4");
@@ -5189,24 +5186,6 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
     );
     await uploadFileToR2(subtitleR2Key, subtitlesPath, "text/plain");
 
-    if (overlayRenderPlan) {
-      const instructionOverlayCues: InstructionOverlayCue[] =
-        overlayRenderPlan.cues.map((cue) => ({
-          startSeconds: cue.startSeconds,
-          endSeconds: cue.endSeconds,
-          text: cue.text,
-        }));
-
-      await writeFile(
-        instructionOverlayPath,
-        buildAssInstructionOverlayFile(
-          instructionOverlayCues,
-          renderDimensions
-        ),
-        "utf8"
-      );
-    }
-
     stage = "voiceover_subtitles_ready";
     await updateVideo(payload.videoId, buildSuccessfulStageUpdate(stage, {
       transcript_r2_key: transcriptR2Key,
@@ -5257,8 +5236,13 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
     stage = "rendering_final";
     await updateStage(payload.videoId, stage);
 
-    const finalRenderProvider =
-      finalRenderer === "remotion" && overlayRenderPlan ? "remotion" : "ffmpeg";
+    const finalRenderProvider = selectFinalRenderProvider({
+      requestedRenderer: finalRenderer,
+      hasOverlayRenderPlan: Boolean(overlayRenderPlan),
+      voiceoverSubtitlesRequired: true,
+    });
+    const finalVoiceoverSubtitleRenderOptions =
+      buildFinalVoiceoverSubtitleRenderOptions({ subtitlesPath });
 
     try {
       if (finalRenderProvider === "remotion" && overlayRenderPlan) {
@@ -5275,14 +5259,10 @@ export async function runProcessVideo(payload: ProcessVideoPayload) {
         await renderFinalVideo({
           mutedClipEditPath,
           voiceoverPath,
-          subtitlesPath,
-          textOverlayPath: overlayRenderPlan ? instructionOverlayPath : null,
+          ...finalVoiceoverSubtitleRenderOptions,
           outputPath: finalRenderPath,
           workDir,
           subtitleFontsDir: SUBTITLE_FONTS_DIR,
-          requireBurnedSubtitles:
-            Boolean(overlayRenderPlan) ||
-            getTargetLanguageCode(targetLanguage) === "zh",
         });
       }
     } catch (error) {
