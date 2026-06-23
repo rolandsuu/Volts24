@@ -293,13 +293,13 @@ export async function loadVideoHistory() {
   const response = await fetch("/api/video-history");
 
   if (!response.ok) {
-    throw new Error(await readErrorMessage(response, "加载最近任务失败。"));
+    throw new Error(await readErrorMessage(response, "加载历史任务失败。"));
   }
 
   const data = (await response.json()) as { history?: unknown };
 
   if (!Array.isArray(data.history)) {
-    throw new Error("最近任务响应无效。");
+    throw new Error("历史任务响应无效。");
   }
 
   return data.history as VideoJobHistoryItem[];

@@ -31,6 +31,10 @@ import {
 
 const BATCH_STATUS_POLL_INTERVAL_MS = 3000;
 
+type UseUploadSessionOptions = {
+  loadHistory?: boolean;
+};
+
 function getUploadItemId(file: File, index: number) {
   return `${file.name}-${file.size}-${file.lastModified}-${index}`;
 }
@@ -40,7 +44,9 @@ type UploadResult = {
   selectionId: string;
 };
 
-export function useUploadSession() {
+export function useUploadSession({
+  loadHistory = true,
+}: UseUploadSessionOptions = {}) {
   const [prompt, setPrompt] = useState("");
   const [targetLanguage, setTargetLanguage] = useState<string>(
     DEFAULT_TARGET_LANGUAGE
@@ -57,7 +63,7 @@ export function useUploadSession() {
   const [videoHistory, setVideoHistory] = useState<VideoJobHistoryItem[]>([]);
   const [historyMessage, setHistoryMessage] = useState<string | null>(null);
   const [historyRefreshCount, setHistoryRefreshCount] = useState(0);
-  const [isLoadingHistory, setIsLoadingHistory] = useState(true);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(loadHistory);
   const [formError, setFormError] = useState<string | null>(null);
   const [downloadingVideoId, setDownloadingVideoId] = useState<string | null>(
     null
@@ -76,6 +82,10 @@ export function useUploadSession() {
   const canGenerate = selectedUploads.length > 0 && !isSubmitting;
 
   useEffect(() => {
+    if (!loadHistory) {
+      return;
+    }
+
     let active = true;
 
     async function refreshVideoHistory() {
@@ -90,7 +100,7 @@ export function useUploadSession() {
         }
       } catch (error) {
         if (active) {
-          setHistoryMessage(getErrorMessage(error, "加载最近任务失败。"));
+          setHistoryMessage(getErrorMessage(error, "加载历史任务失败。"));
         }
       } finally {
         if (active) {
@@ -104,7 +114,7 @@ export function useUploadSession() {
     return () => {
       active = false;
     };
-  }, [historyRefreshCount]);
+  }, [historyRefreshCount, loadHistory]);
 
   useEffect(() => {
     if (!activeBatchId) {
@@ -477,9 +487,9 @@ export function useUploadSession() {
     activeBatchId,
     batchStatus,
     batchStatusMessage,
-    videoHistory,
-    historyMessage,
-    isLoadingHistory,
+    videoHistory: loadHistory ? videoHistory : [],
+    historyMessage: loadHistory ? historyMessage : null,
+    isLoadingHistory: loadHistory ? isLoadingHistory : false,
     formError,
     downloadingVideoId,
     downloadingInstructionPdfId,

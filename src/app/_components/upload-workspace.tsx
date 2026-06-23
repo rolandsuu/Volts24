@@ -3,13 +3,12 @@
 import { useUploadSession } from "./use-upload-session";
 import {
   AppHeader,
-  RecentJobs,
   UploadForm,
   UploadProgressList,
 } from "./upload-workspace-ui";
 
 export function UploadWorkspace() {
-  const uploadSession = useUploadSession();
+  const uploadSession = useUploadSession({ loadHistory: false });
 
   return (
     <main className="min-h-screen bg-[#f6f7fb] text-[#11131a]">
@@ -46,14 +45,6 @@ export function UploadWorkspace() {
         onDownloadVideo={uploadSession.downloadVideo}
         onDownloadInstructionPdf={uploadSession.downloadInstructionPdf}
         onRetryProcessing={uploadSession.retryProcessing}
-      />
-
-      <RecentJobs
-        items={uploadSession.videoHistory}
-        isLoading={uploadSession.isLoadingHistory}
-        message={uploadSession.historyMessage}
-        activeBatchId={uploadSession.activeBatchId}
-        onSelect={uploadSession.openHistoryBatch}
       />
     </main>
   );

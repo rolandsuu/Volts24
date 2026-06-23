@@ -1,3 +1,4 @@
+import Link from "next/link";
 import type { ChangeEvent, DragEvent, FormEvent } from "react";
 
 import {
@@ -226,14 +227,6 @@ function UserIcon({ className }: { className?: string }) {
   );
 }
 
-function LogoMark() {
-  return (
-    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-[#ee2b2f] text-xl font-black text-white shadow-sm shadow-red-600/20">
-      B
-    </div>
-  );
-}
-
 function FileThumb() {
   return (
     <div className="relative h-[58px] w-[70px] shrink-0 overflow-hidden rounded-lg bg-[#eef1f6]">
@@ -341,12 +334,23 @@ function getHistoryStatusClasses(status: VideoJobHistoryItem["status"]) {
   }
 }
 
-export function AppHeader() {
+type AppHeaderProps = {
+  navLink?: {
+    href: string;
+    label: string;
+  };
+};
+
+export function AppHeader({
+  navLink = {
+    href: "/history",
+    label: "历史任务",
+  },
+}: AppHeaderProps) {
   return (
     <header className="border-b border-[#d5dbe5] bg-white">
       <div className="flex h-16 items-center justify-between px-5 sm:px-8">
         <div className="flex min-w-0 items-center gap-4">
-          <LogoMark />
           <div className="flex min-w-0 items-center gap-4">
             <p className="truncate text-2xl font-bold tracking-tight text-[#11131a]">
               Volts24
@@ -359,12 +363,12 @@ export function AppHeader() {
         </div>
 
         <div className="flex items-center gap-4">
-          <a
-            href="#upload-progress"
+          <Link
+            href={navLink.href}
             className="hidden text-sm font-semibold text-[#11131a] transition hover:text-[#ee2b2f] sm:inline"
           >
-            上传进度
-          </a>
+            {navLink.label}
+          </Link>
           <button
             type="button"
             className="flex h-9 w-9 items-center justify-center rounded-full border border-[#aeb7c5] text-[#586273] transition hover:border-[#11131a] hover:text-[#11131a]"
@@ -541,6 +545,7 @@ type RecentJobsProps = {
   isLoading: boolean;
   message: string | null;
   activeBatchId: string | null;
+  showEmptyState?: boolean;
   onSelect(batchId: string): void;
 };
 
@@ -549,6 +554,7 @@ export function RecentJobs({
   isLoading,
   message,
   activeBatchId,
+  showEmptyState = false,
   onSelect,
 }: RecentJobsProps) {
   if (isLoading && items.length === 0) {
@@ -556,17 +562,17 @@ export function RecentJobs({
       <section className="border-t border-[#d5dbe5] bg-white px-4 py-5 sm:px-8">
         <div className="mx-auto max-w-[1100px]">
           <h2 className="text-2xl font-bold tracking-tight text-[#11131a]">
-            最近任务
+            历史任务
           </h2>
           <p className="mt-2 text-sm font-medium text-[#6f7785]">
-            正在加载最近任务...
+            正在加载历史任务...
           </p>
         </div>
       </section>
     );
   }
 
-  if (items.length === 0 && !message) {
+  if (items.length === 0 && !message && !showEmptyState) {
     return null;
   }
 
@@ -576,7 +582,7 @@ export function RecentJobs({
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
             <h2 className="text-2xl font-bold tracking-tight text-[#11131a]">
-              最近任务
+              历史任务
             </h2>
             {message && (
               <p className="mt-1 text-sm font-medium text-[#c81818]">
@@ -585,6 +591,12 @@ export function RecentJobs({
             )}
           </div>
         </div>
+
+        {items.length === 0 && !message && (
+          <div className="mt-3 rounded-lg border border-[#cfd6e1] bg-[#fbfcfe] px-4 py-5 text-sm font-medium text-[#6f7785]">
+            最近 7 天没有历史任务。
+          </div>
+        )}
 
         {items.length > 0 && (
           <div className="mt-3 overflow-hidden rounded-lg border border-[#cfd6e1] bg-white">

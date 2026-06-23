@@ -14,7 +14,7 @@ export type VideoJobHistoryItem = {
   createdAt: string;
 };
 
-export const RECENT_VIDEO_HISTORY_WINDOW_MS = 60 * 60 * 1000;
+export const RECENT_VIDEO_HISTORY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 type BatchRow = {
   id: string;

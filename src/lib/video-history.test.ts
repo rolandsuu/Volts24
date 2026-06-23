@@ -26,8 +26,8 @@ function historyItem(id: string, updatedAt: string) {
   };
 }
 
-test("filterRecentVideoJobs includes jobs updated within 60 minutes", () => {
-  const updatedAt = new Date(nowMs - 30 * 60 * 1000).toISOString();
+test("filterRecentVideoJobs includes jobs updated within 7 days", () => {
+  const updatedAt = new Date(nowMs - 6 * 24 * 60 * 60 * 1000).toISOString();
 
   assert.deepEqual(
     filterRecentVideoJobs([historyItem("recent", updatedAt)], nowMs),
@@ -35,7 +35,7 @@ test("filterRecentVideoJobs includes jobs updated within 60 minutes", () => {
   );
 });
 
-test("filterRecentVideoJobs includes jobs updated exactly 60 minutes ago", () => {
+test("filterRecentVideoJobs includes jobs updated exactly 7 days ago", () => {
   const updatedAt = new Date(nowMs - RECENT_VIDEO_HISTORY_WINDOW_MS).toISOString();
 
   assert.deepEqual(
@@ -44,7 +44,7 @@ test("filterRecentVideoJobs includes jobs updated exactly 60 minutes ago", () =>
   );
 });
 
-test("filterRecentVideoJobs excludes jobs older than 60 minutes", () => {
+test("filterRecentVideoJobs excludes jobs older than 7 days", () => {
   const updatedAt = new Date(
     nowMs - RECENT_VIDEO_HISTORY_WINDOW_MS - 1
   ).toISOString();
