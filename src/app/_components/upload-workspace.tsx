@@ -1570,7 +1570,7 @@ export function UploadWorkspace() {
               disabled={isSubmitting}
               className="sr-only"
             />
-            将视频拖到这里//点击选择视频上传
+            将视频拖到这里/点击选择视频上传
           </label>
 
           <SelectedFiles selections={selectedUploads} />
